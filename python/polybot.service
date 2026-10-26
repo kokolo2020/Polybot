@@ -1,0 +1,14 @@
+[Unit]
+Description=Polybot paper trading server
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/polybot
+Environment=TG_TOKEN=PUT_BOT_TOKEN_HERE
+Environment=TG_CHAT=PUT_CHAT_ID_HERE
+ExecStart=/usr/bin/python3 /opt/polybot/polybot_server.py --interval 60 --port 8787
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
