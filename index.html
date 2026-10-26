@@ -179,6 +179,31 @@
 </div>
 <div class="card warn" id="errBox" style="display:none"></div>
 
+<div class="card" id="udCard">
+  <div class="ct"><h2>Underdog desk</h2><span class="k mono" id="uNote">-</span></div>
+  <div class="k" style="margin-bottom:8px">Separate $1,000 paper account. Always takes the cheaper (losing) side of each market, flat bet, no stops, rides to resolution. Fee 5% rate assumed.</div>
+  <div class="tiles">
+    <div class="tile"><div class="k">Balance</div><div class="v" id="uEq">-</div></div>
+    <div class="tile"><div class="k">Realized P&amp;L</div><div class="v" id="uReal">-</div></div>
+    <div class="tile"><div class="k">Win rate</div><div class="v" id="uWr">-</div></div>
+    <div class="tile"><div class="k">Fees paid</div><div class="v" id="uFee">-</div></div>
+    <div class="tile"><div class="k">Open</div><div class="v" id="uOpen">-</div></div>
+    <div class="tile"><div class="k">Avg paid</div><div class="v" id="uPaid">-</div></div>
+  </div>
+  <div class="row" style="margin-top:10px;gap:8px;align-items:end">
+    <label class="k">bet $ <input id="uBet" type="number" style="width:64px"></label>
+    <label class="k">max price <input id="uMax" type="number" step="0.05" style="width:64px"></label>
+    <label class="k">ends within h <input id="uHrs" type="number" style="width:64px"></label>
+    <button class="sec sm" id="uOnBtn">On</button>
+    <button class="red sm" id="uReset">Reset desk</button>
+  </div>
+  <div id="uCal" style="margin-top:8px"></div>
+  <div class="k" style="margin-top:10px">OPEN UNDERDOG BETS</div>
+  <div id="uPos"></div>
+  <div class="k" style="margin-top:10px">LAST SETTLED</div>
+  <div id="uLog"></div>
+</div>
+
 <div class="card" id="btcCard">
   <div class="ct"><h2>BTC desk &middot; 15m + 1h</h2><span class="k mono" id="btcNote">-</span></div>
   <div class="k" style="margin-bottom:8px">Separate $1,000 paper account. Taker fee on (7% rate), hold to settlement, every bet logged for calibration.</div>
@@ -271,7 +296,7 @@
 </div>
 
 <script>
-const VERSION = "v2.4";
+const VERSION = "v2.5";
 const BUILD = "2026-10-26 11:40";
 const ON_WEB = location.protocol.startsWith("http");
 const BIN = ON_WEB ? "/binance" : "https://data-api.binance.vision";
@@ -523,6 +548,7 @@ async function btcDesk(bm) {
   const need = [...new Set([...bm.flatMap(m => m.tokens), ...Object.keys(bt.positions)])];
   const books = {};
   await Promise.all(need.map(async t => { try { books[t] = await fetchBook(t); } catch (e) { /* skip */ } }));
+  Object.assign(allBooks, books);
   for (const [tok, pos] of Object.entries(bt.positions)) { const b = books[tok]; if (b && b[0].length) pos.last = b[0][0][0]; }
   for (const m of bm) {
     if (m.tokens.some(t => bt.positions[t])) continue;
@@ -591,6 +617,96 @@ $("bBet").onchange = () => { BC.bet = Math.max(1, parseFloat($("bBet").value) ||
 $("bLot").onchange = () => { BC.lot = Math.max(1, parseFloat($("bLot").value) || BDEF.lot); store("pb_bcfg", BC); };
 $("bLotBtn").onclick = () => { BC.lottery = BC.lottery ? 0 : 1; store("pb_bcfg", BC); renderBtc(); };
 $("bReset").onclick = () => { if (confirm("Reset the BTC desk?")) { bt = newBt(); store("pb_btc", bt); renderBtc(); } };
+
+// ---- Underdog desk: always take the cheaper ("losing") side, $ flat, hold to resolution ----
+const UFEE = 0.05;   // assumed generic non-crypto taker rate (some categories differ)
+const UDEF = { on: 1, bet: 20, minP: 0.05, maxP: 0.45, hours: 48, maxOpen: 40, maxSpread: 0.03 };
+let UC = Object.assign({}, UDEF, store("pb_ucfg") || {});
+const newUd = () => ({ cash: 1000, start: 1000, positions: {}, realized: 0, w: 0, l: 0, fees: 0, log: [] });
+let ud = store("pb_ud") || newUd();
+let allBooks = {};
+const uFee = (sh, px) => sh * UFEE * px * (1 - px);
+function uEquity() { return ud.cash + Object.values(ud.positions).reduce((a, p) => a + p.shares * (p.last ?? p.entry), 0); }
+async function udSettle() {
+  const due = Object.entries(ud.positions).filter(([, p]) => p.end && p.end < Date.now()).slice(0, 8);
+  await Promise.all(due.map(async ([tok, pos]) => {
+    try {
+      const r = await getJSON(GAMMA + "/markets", { clob_token_ids: tok });
+      const m = Array.isArray(r) ? r[0] : null;
+      if (!m || !m.closed) return;
+      const idx = parseList(m.clobTokenIds).indexOf(tok), prices = parseList(m.outcomePrices).map(Number);
+      if (idx < 0 || prices.length !== 2 || !prices.every(x => x === 0 || x === 1 || x === 0.5)) return;
+      const payout = pos.shares * prices[idx], pnl = payout - pos.cost, win = prices[idx] === 1;
+      ud.cash += payout; ud.realized += pnl; (pnl > 0 ? ud.w++ : ud.l++);
+      const L = ud.log.find(x => x.tok === tok && x.win === null);
+      if (L) { L.win = pnl > 0; L.pnl = pnl; }
+      delete ud.positions[tok];
+      log(`Underdog ${win ? "WIN" : prices[idx] === 0.5 ? "REFUND" : "LOSS"} ${sgn(pnl)} | ${pos.q.slice(0, 40)}`, "TRADE");
+    } catch (e) { /* retry next scan */ }
+  }));
+}
+async function udDesk(markets) {
+  if (!UC.on) return;
+  const now = clock();
+  await udSettle();
+  // refresh marks for held tokens
+  const held = Object.keys(ud.positions).filter(t => !allBooks[t]);
+  for (let i = 0; i < held.length; i += 8)
+    await Promise.all(held.slice(i, i + 8).map(async t => { try { allBooks[t] = await fetchBook(t); } catch (e) { /* skip */ } }));
+  for (const [tok, pos] of Object.entries(ud.positions)) { const b = allBooks[tok]; if (b && b[0].length) pos.last = b[0][0][0]; }
+  const lim = UC.hours * 3600e3;
+  for (const m of markets) {
+    if (Object.keys(ud.positions).length >= UC.maxOpen || ud.cash < UC.bet) break;
+    if (!m.end || m.end < Date.now() + 20 * 60e3 || m.end - Date.now() > lim) continue;
+    if (m.tokens.some(t => ud.positions[t]) || ud.log.some(x => m.tokens.includes(x.tok))) continue;   // one try per market
+    const bks = m.tokens.map(t => allBooks[t]);
+    if (bks.some(b => !b || !b[0].length || !b[1].length)) continue;
+    const mids = bks.map(b => (b[0][0][0] + b[1][0][0]) / 2);
+    const k = mids[0] <= mids[1] ? 0 : 1;               // the losing / cheaper side
+    const [bids, asks] = bks[k], ask = asks[0][0];
+    if (ask < UC.minP || ask > UC.maxP || ask - bids[0][0] > UC.maxSpread) continue;
+    const [shares, cost, avg] = walkBuy(asks, UC.bet);
+    if (shares <= 0) continue;
+    const fee = uFee(shares, avg);
+    if (cost + fee > ud.cash) continue;
+    const tok = m.tokens[k];
+    ud.cash -= cost + fee; ud.fees += fee;
+    ud.positions[tok] = { q: m.q, o: m.outcomes[k], shares, entry: avg, cost: cost + fee, opened: now, end: m.end, last: bids[0][0] };
+    ud.log.push({ tok, t: now, o: m.outcomes[k], q: m.q, ask: avg, win: null, pnl: null });
+    ud.log = ud.log.slice(-600);
+    log(`Underdog BUY ${m.outcomes[k]} @ ${avg.toFixed(3)} $${cost.toFixed(1)} | ${m.q.slice(0, 40)}`, "TRADE");
+  }
+  store("pb_ud", ud);
+}
+function renderUd() {
+  const eq = uEquity(), n = ud.w + ud.l, pos = Object.entries(ud.positions), done = ud.log.filter(x => x.win !== null);
+  $("uEq").innerHTML = `<span class="${eq >= ud.start ? "pos" : "neg"}">${fmt(eq)}</span>`;
+  $("uReal").innerHTML = `<span class="${ud.realized >= 0 ? "pos" : "neg"}">${sgn(ud.realized)}</span>`;
+  $("uWr").textContent = n ? `${Math.round(ud.w / n * 100)}% (${ud.w}/${n})` : "-";
+  $("uFee").textContent = fmt(ud.fees);
+  $("uOpen").textContent = `${pos.length}/${UC.maxOpen}`;
+  const avgPaid = done.length ? done.reduce((a, x) => a + x.ask, 0) / done.length * 100 : null;
+  $("uPaid").textContent = avgPaid === null ? "-" : avgPaid.toFixed(0) + "¢";
+  $("uNote").textContent = `${n} settled · ${UC.on ? "on" : "off"}`;
+  $("uOnBtn").textContent = UC.on ? "On" : "Off";
+  if (document.activeElement !== $("uBet")) $("uBet").value = UC.bet;
+  if (document.activeElement !== $("uMax")) $("uMax").value = UC.maxP;
+  if (document.activeElement !== $("uHrs")) $("uHrs").value = UC.hours;
+  $("uCal").innerHTML = done.length
+    ? `<div class="k">Paid avg ${avgPaid.toFixed(0)}¢ (= implied win chance). Actual win rate ${Math.round(ud.w / Math.max(1, n) * 100)}%. If actual &lt; paid, the underdogs are overpriced (longshot bias). Needs 100+ settled.</div>`
+    : `<div class="k">Waiting for the first underdog to settle.</div>`;
+  $("uPos").innerHTML = pos.map(([t, p]) => {
+    const u = (p.last - p.entry) * p.shares;
+    return `<div class="brow"><span>${esc(p.o)} @ ${p.entry.toFixed(3)} ($${p.cost.toFixed(0)}) <span class="cd" data-end="${p.end}"></span><br><small class="k">${esc(p.q.slice(0, 60))}</small></span><b class="${u >= 0 ? "pos" : "neg"}">${sgn(u)}</b></div>`;
+  }).join("") || `<div class="empty">No open underdog bets yet.</div>`;
+  $("uLog").innerHTML = done.slice(-8).reverse().map(x =>
+    `<div class="brow"><span>${esc(x.o)} @ ${(x.ask * 100).toFixed(0)}¢ <small class="k">${esc(x.q.slice(0, 44))}</small></span><b class="${x.win ? "pos" : "neg"}">${x.win ? "WIN" : "LOSS"} ${sgn(x.pnl)}</b></div>`).join("") || `<div class="empty">Nothing settled yet.</div>`;
+}
+$("uBet").onchange = () => { UC.bet = Math.max(1, parseFloat($("uBet").value) || UDEF.bet); store("pb_ucfg", UC); };
+$("uMax").onchange = () => { UC.maxP = Math.min(0.5, Math.max(0.06, parseFloat($("uMax").value) || UDEF.maxP)); store("pb_ucfg", UC); };
+$("uHrs").onchange = () => { UC.hours = Math.max(1, parseFloat($("uHrs").value) || UDEF.hours); store("pb_ucfg", UC); };
+$("uOnBtn").onclick = () => { UC.on = UC.on ? 0 : 1; store("pb_ucfg", UC); renderUd(); };
+$("uReset").onclick = () => { if (confirm("Reset the Underdog desk?")) { ud = newUd(); store("pb_ud", ud); renderUd(); } };
 function walkBuy(asks, usd) {
   let shares = 0, cost = 0;
   for (const [p, s] of asks) {
@@ -660,7 +776,7 @@ async function scan() {
   const now = clock(), marks = {}, books = {};
   try {
     const markets = await fetchMarkets();
-    btcCtx = null;
+    btcCtx = null; allBooks = {};
     if (CFG.btc_on || Object.values(st.positions).some(p => p.btc)) {
       try { btcCtx = await fetchBtcCtx(); } catch (e) { log("BTC feed error: " + e.message); }
     }
@@ -732,6 +848,7 @@ async function scan() {
       const chunk = markets.slice(i, i + 4);
       const fetched = await Promise.all(chunk.map(m =>
         Promise.all(m.tokens.map(tok => books[tok] ? books[tok] : fetchBook(tok).catch(() => null)))));
+      chunk.forEach((m, j) => m.tokens.forEach((t, k) => { if (fetched[j][k]) allBooks[t] = fetched[j][k]; }));
       for (let j = 0; j < chunk.length; j++) {
         const m = chunk[j], held = m.tokens.some(t => st.positions[t]);
         let best = null;
@@ -764,6 +881,7 @@ async function scan() {
         }
       }
     }
+    try { await udDesk(markets); } catch (e) { log("Underdog desk error: " + e.message, "ERR"); }
     cands.sort((a, b) => b.edge - a.edge);
     st.top = cands[0] || null;
     st.pick = cands.find(c => !c.held) || null;
@@ -993,7 +1111,7 @@ function render() {
     </div>`;
   }).join("") || `<div class="empty">Run a scan to see what the bot is looking at.</div>`;
 
-  renderBtc();
+  renderBtc(); renderUd();
   drawChart(); drawHist();
   tick();
 }
