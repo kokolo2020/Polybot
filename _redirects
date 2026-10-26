@@ -1,0 +1,3 @@
+/gamma/*  https://gamma-api.polymarket.com/:splat  200
+/clob/*   https://clob.polymarket.com/:splat  200
+/binance/*  https://data-api.binance.vision/:splat  200
