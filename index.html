@@ -627,22 +627,42 @@ let ud = store("pb_ud") || newUd();
 let allBooks = {};
 const uFee = (sh, px) => sh * UFEE * px * (1 - px);
 function uEquity() { return ud.cash + Object.values(ud.positions).reduce((a, p) => a + p.shares * (p.last ?? p.entry), 0); }
+let udErr = "";
+async function udLookup(tok) {
+  // Gamma may hide closed markets by default, so retry explicitly asking for closed ones
+  for (const extra of [{}, { closed: "true" }]) {
+    const r = await getJSON(GAMMA + "/markets", Object.assign({ clob_token_ids: tok }, extra));
+    const m = Array.isArray(r) ? r.find(x => parseList(x.clobTokenIds).includes(tok)) : null;
+    if (m) return m;
+  }
+  return null;
+}
 async function udSettle() {
-  const due = Object.entries(ud.positions).filter(([, p]) => p.end && p.end < Date.now()).slice(0, 8);
+  const now = Date.now();
+  // least-recently-checked first, so a few stuck bets can never starve the rest
+  const due = Object.entries(ud.positions).filter(([, p]) => p.end && p.end < now)
+    .sort((a, b) => (a[1].chk || 0) - (b[1].chk || 0)).slice(0, 12);
+  udErr = "";
   await Promise.all(due.map(async ([tok, pos]) => {
+    pos.chk = now;
     try {
-      const r = await getJSON(GAMMA + "/markets", { clob_token_ids: tok });
-      const m = Array.isArray(r) ? r[0] : null;
-      if (!m || !m.closed) return;
+      const m = await udLookup(tok);
+      if (!m) { pos.why = "market not found"; return; }
+      const done = m.closed || String(m.umaResolutionStatus || "").toLowerCase() === "resolved";
+      if (!done) { pos.why = "not closed yet"; return; }
       const idx = parseList(m.clobTokenIds).indexOf(tok), prices = parseList(m.outcomePrices).map(Number);
-      if (idx < 0 || prices.length !== 2 || !prices.every(x => x === 0 || x === 1 || x === 0.5)) return;
-      const payout = pos.shares * prices[idx], pnl = payout - pos.cost, win = prices[idx] === 1;
+      if (idx < 0 || prices.length !== 2 || prices.some(isNaN)) { pos.why = "bad prices"; return; }
+      let px;   // final price of our token: 1, 0 or 0.5 (tolerates 0.9995 / 0.0005 style values)
+      if (Math.max(...prices) >= 0.98) px = prices[idx] >= 0.5 ? 1 : 0;
+      else if (prices.every(x => Math.abs(x - 0.5) < 0.03)) px = 0.5;
+      else { pos.why = "prices not final " + prices.map(x => x.toFixed(2)).join("/"); return; }
+      const payout = pos.shares * px, pnl = payout - pos.cost, win = px === 1;
       ud.cash += payout; ud.realized += pnl; (pnl > 0 ? ud.w++ : ud.l++);
       const L = ud.log.find(x => x.tok === tok && x.win === null);
       if (L) { L.win = pnl > 0; L.pnl = pnl; }
       delete ud.positions[tok];
-      log(`Underdog ${win ? "WIN" : prices[idx] === 0.5 ? "REFUND" : "LOSS"} ${sgn(pnl)} | ${pos.q.slice(0, 40)}`, "TRADE");
-    } catch (e) { /* retry next scan */ }
+      log(`Underdog ${win ? "WIN" : px === 0.5 ? "REFUND" : "LOSS"} ${sgn(pnl)} | ${pos.q.slice(0, 40)}`, "TRADE");
+    } catch (e) { pos.why = "lookup error: " + e.message; udErr = e.message; }
   }));
 }
 async function udDesk(markets) {
@@ -687,7 +707,8 @@ function renderUd() {
   $("uOpen").textContent = `${pos.length}/${UC.maxOpen}`;
   const avgPaid = done.length ? done.reduce((a, x) => a + x.ask, 0) / done.length * 100 : null;
   $("uPaid").textContent = avgPaid === null ? "-" : avgPaid.toFixed(0) + "¢";
-  $("uNote").textContent = `${n} settled · ${UC.on ? "on" : "off"}`;
+  const stale = pos.filter(([, p]) => p.end && p.end < Date.now()).length;
+  $("uNote").textContent = `${n} settled · ${stale ? stale + " stale · " : ""}${UC.on ? "on" : "off"}`;
   $("uOnBtn").textContent = UC.on ? "On" : "Off";
   if (document.activeElement !== $("uBet")) $("uBet").value = UC.bet;
   if (document.activeElement !== $("uMax")) $("uMax").value = UC.maxP;
@@ -697,7 +718,7 @@ function renderUd() {
     : `<div class="k">Waiting for the first underdog to settle.</div>`;
   $("uPos").innerHTML = pos.map(([t, p]) => {
     const u = (p.last - p.entry) * p.shares;
-    return `<div class="brow"><span>${esc(p.o)} @ ${p.entry.toFixed(3)} ($${p.cost.toFixed(0)}) <span class="cd" data-end="${p.end}"></span><br><small class="k">${esc(p.q.slice(0, 60))}</small></span><b class="${u >= 0 ? "pos" : "neg"}">${sgn(u)}</b></div>`;
+    return `<div class="brow"><span>${esc(p.o)} @ ${p.entry.toFixed(3)} ($${p.cost.toFixed(0)}) <span class="cd" data-end="${p.end}"></span>${p.end < Date.now() ? ` <small class="neg">⚠ past end${p.why ? " · " + esc(p.why) : ""}</small>` : ""}<br><small class="k">${esc(p.q.slice(0, 60))}</small></span><b class="${u >= 0 ? "pos" : "neg"}">${sgn(u)}</b></div>`;
   }).join("") || `<div class="empty">No open underdog bets yet.</div>`;
   $("uLog").innerHTML = done.slice(-8).reverse().map(x =>
     `<div class="brow"><span>${esc(x.o)} @ ${(x.ask * 100).toFixed(0)}¢ <small class="k">${esc(x.q.slice(0, 44))}</small></span><b class="${x.win ? "pos" : "neg"}">${x.win ? "WIN" : "LOSS"} ${sgn(x.pnl)}</b></div>`).join("") || `<div class="empty">Nothing settled yet.</div>`;
