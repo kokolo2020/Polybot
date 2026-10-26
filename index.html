@@ -26,6 +26,9 @@
   .tkin{display:inline-block;padding:6px 0;font:600 11px ui-monospace,Menlo,monospace;color:var(--mut);animation:tk 38s linear infinite}
   .tkin b{color:var(--tx)}
   @keyframes tk{to{transform:translateX(-50%)}}
+  .bt{display:grid;grid-template-columns:1.1fr .5fr .7fr .7fr .9fr;gap:6px;font:11px ui-monospace,monospace;padding:4px 0;border-bottom:1px solid var(--line)}
+  .bt.h{color:var(--mut)}
+  .brow{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:12px}
   .ct.clk{cursor:pointer;user-select:none}
   .ct .chev{display:inline-block;transition:transform .2s;margin-right:6px;color:var(--mut)}
   .card.shut .chev{transform:rotate(-90deg)}
@@ -176,6 +179,32 @@
 </div>
 <div class="card warn" id="errBox" style="display:none"></div>
 
+<div class="card" id="btcCard">
+  <div class="ct"><h2>BTC desk &middot; 15m + 1h</h2><span class="k mono" id="btcNote">-</span></div>
+  <div class="k" style="margin-bottom:8px">Separate $1,000 paper account. Taker fee on (7% rate), hold to settlement, every bet logged for calibration.</div>
+  <div class="tiles">
+    <div class="tile"><div class="k">Balance</div><div class="v" id="bEq">-</div></div>
+    <div class="tile"><div class="k">Realized P&amp;L</div><div class="v" id="bReal">-</div></div>
+    <div class="tile"><div class="k">Win rate</div><div class="v" id="bWr">-</div></div>
+    <div class="tile"><div class="k">Fees paid</div><div class="v" id="bFee">-</div></div>
+    <div class="tile"><div class="k">Open</div><div class="v" id="bOpen">-</div></div>
+    <div class="tile"><div class="k">BTC spot</div><div class="v" id="bSpot">-</div></div>
+  </div>
+  <div class="row" style="margin-top:10px;gap:8px;align-items:end">
+    <label class="k">min edge <input id="bEdge" type="number" step="0.01" style="width:64px"></label>
+    <label class="k">bet $ <input id="bBet" type="number" style="width:64px"></label>
+    <label class="k">lottery $ <input id="bLot" type="number" style="width:64px"></label>
+    <button class="sec sm" id="bLotBtn">Lottery: on</button>
+    <button class="red sm" id="bReset">Reset desk</button>
+  </div>
+  <div class="k" style="margin-top:10px">CALIBRATION &middot; does the model's probability match reality?</div>
+  <div id="bCal"></div>
+  <div class="k" style="margin-top:10px">OPEN BTC BETS</div>
+  <div id="bPos"></div>
+  <div class="k" style="margin-top:10px">LAST SETTLED</div>
+  <div id="bLog"></div>
+</div>
+
 <div class="card">
   <div class="ct"><h2>Agent desk</h2><span class="k mono" id="stageTxt">idle</span></div>
   <div id="agents"><canvas id="agweb"></canvas></div>
@@ -242,7 +271,7 @@
 </div>
 
 <script>
-const VERSION = "v2.3";
+const VERSION = "v2.4";
 const BUILD = "2026-10-26 11:40";
 const ON_WEB = location.protocol.startsWith("http");
 const BIN = ON_WEB ? "/binance" : "https://data-api.binance.vision";
@@ -466,6 +495,102 @@ async function fetchBtcMarkets() {
   }));
   return out;
 }
+
+// ---- BTC desk: separate paper account, fees on, hold to settlement, calibration log ----
+const BFEE = 0.07;
+const BDEF = { on: 1, edge: 0.04, bet: 20, lot: 5, lottery: 1 };
+let BC = Object.assign({}, BDEF, store("pb_bcfg") || {});
+const newBt = () => ({ cash: 1000, start: 1000, positions: {}, realized: 0, w: 0, l: 0, fees: 0, log: [], curve: [] });
+let bt = store("pb_btc") || newBt();
+const bFee = (sh, px) => sh * BFEE * px * (1 - px);
+function bEquity() { return bt.cash + Object.values(bt.positions).reduce((a, p) => a + p.shares * (p.last ?? p.entry), 0); }
+async function btcDesk(bm) {
+  if (!BC.on || !btcCtx) return;
+  const now = clock();
+  // settle expired windows (approx via Binance 1m close; real resolution is Chainlink)
+  for (const [tok, pos] of Object.entries(bt.positions)) {
+    if (Date.now() < pos.end + 15000) continue;
+    const endPx = btcCtx.close[Math.floor((pos.end - 60000) / 60000) * 60000];
+    if (!endPx) continue;
+    const win = (endPx > pos.K) === pos.up, payout = win ? pos.shares : 0, pnl = payout - pos.cost;
+    bt.cash += payout; bt.realized += pnl; win ? bt.w++ : bt.l++;
+    const L = bt.log.find(x => x.tok === tok && x.win === null);
+    if (L) { L.win = win; L.pnl = pnl; L.endPx = endPx; }
+    delete bt.positions[tok];
+    log(`BTC desk ${win ? "WIN" : "LOSS"} ${sgn(pnl)} (${pos.o})`, "TRADE");
+  }
+  // books for markets + held tokens
+  const need = [...new Set([...bm.flatMap(m => m.tokens), ...Object.keys(bt.positions)])];
+  const books = {};
+  await Promise.all(need.map(async t => { try { books[t] = await fetchBook(t); } catch (e) { /* skip */ } }));
+  for (const [tok, pos] of Object.entries(bt.positions)) { const b = books[tok]; if (b && b[0].length) pos.last = b[0][0][0]; }
+  for (const m of bm) {
+    if (m.tokens.some(t => bt.positions[t])) continue;
+    const tau = (m.end - Date.now()) / 60000;
+    if (tau < 1.5) continue;
+    const pu = btcPUp(m.btc.K, m.end);
+    let best = null;
+    for (let k = 0; k < 2; k++) {
+      const bk = books[m.tokens[k]]; if (!bk || !bk[0].length || !bk[1].length) continue;
+      const ask = bk[1][0][0], p = k === m.btc.upIdx ? pu : 1 - pu;
+      const edge = p - ask - BFEE * ask * (1 - ask);
+      let strat = null;
+      if (ask >= 0.10 && ask <= 0.90 && edge >= BC.edge) strat = "model";
+      else if (BC.lottery && m.btc.kind === "15m" && tau <= 5 && ask < 0.10 && edge >= 0.03) strat = "lottery";
+      if (strat && (!best || edge > best.edge)) best = { k, ask, p, edge, strat, asks: bk[1], bids: bk[0] };
+    }
+    if (!best) continue;
+    const usd = Math.min(best.strat === "lottery" ? BC.lot : BC.bet, bt.cash);
+    if (usd < 1) continue;
+    const [shares, cost, avg] = walkBuy(best.asks, usd);
+    if (shares <= 0) continue;
+    const fee = bFee(shares, avg);
+    if (cost + fee > bt.cash) continue;
+    const tok = m.tokens[best.k], o = m.outcomes[best.k];
+    bt.cash -= cost + fee; bt.fees += fee;
+    bt.positions[tok] = { q: m.q, o, shares, entry: avg, cost: cost + fee, opened: now, end: m.end, K: m.btc.K, up: best.k === m.btc.upIdx, last: best.bids[0][0], strat: best.strat };
+    bt.log.push({ tok, t: now, strat: best.strat, kind: m.btc.kind, o, ask: avg, p: best.p, win: null, pnl: null });
+    bt.log = bt.log.slice(-400);
+    log(`BTC desk ${best.strat.toUpperCase()} ${o} @ ${avg.toFixed(3)} p=${best.p.toFixed(2)} ($${cost.toFixed(1)} + fee ${fee.toFixed(2)})`, "TRADE");
+    toast(`BTC ${best.strat}: ${o} @ ${avg.toFixed(2)}`, "BUY");
+  }
+  bt.curve.push([Date.now(), bEquity()]); bt.curve = bt.curve.slice(-800);
+  store("pb_btc", bt);
+}
+function renderBtc() {
+  const eq = bEquity(), n = bt.w + bt.l, pos = Object.entries(bt.positions);
+  $("bEq").innerHTML = `<span class="${eq >= bt.start ? "pos" : "neg"}">${fmt(eq)}</span>`;
+  $("bReal").innerHTML = `<span class="${bt.realized >= 0 ? "pos" : "neg"}">${sgn(bt.realized)}</span>`;
+  $("bWr").textContent = n ? `${Math.round(bt.w / n * 100)}% (${bt.w}/${n})` : "-";
+  $("bFee").textContent = fmt(bt.fees);
+  $("bOpen").textContent = pos.length;
+  $("bSpot").textContent = st.btc ? "$" + Math.round(st.btc.S).toLocaleString() : "-";
+  $("btcNote").textContent = `${n} settled · ${BC.on ? "on" : "off"}`;
+  $("bLotBtn").textContent = "Lottery: " + (BC.lottery ? "on" : "off");
+  if (document.activeElement !== $("bEdge")) $("bEdge").value = BC.edge;
+  if (document.activeElement !== $("bBet")) $("bBet").value = BC.bet;
+  if (document.activeElement !== $("bLot")) $("bLot").value = BC.lot;
+  const rows = ["model", "lottery"].map(sname => {
+    const d = bt.log.filter(x => x.strat === sname && x.win !== null);
+    if (!d.length) return `<div class="bt"><span>${sname}</span><span>0</span><span>-</span><span>-</span><span>-</span></div>`;
+    const wr = d.filter(x => x.win).length / d.length * 100, mp = d.reduce((a, x) => a + x.p, 0) / d.length * 100,
+      ap = d.reduce((a, x) => a + x.ask, 0) / d.length * 100, pnl = d.reduce((a, x) => a + x.pnl, 0);
+    return `<div class="bt"><span>${sname}</span><span>${d.length}</span><span>${wr.toFixed(0)}%</span><span>${mp.toFixed(0)}% / ${ap.toFixed(0)}¢</span><b class="${pnl >= 0 ? "pos" : "neg"}">${sgn(pnl)}</b></div>`;
+  });
+  $("bCal").innerHTML = `<div class="bt h"><span>strategy</span><span>n</span><span>won</span><span>model/paid</span><span>P&amp;L</span></div>` + rows.join("") +
+    `<div class="k" style="margin-top:4px">If "won" is well below "model", the model is overconfident. Judge after 100+ settled.</div>`;
+  $("bPos").innerHTML = pos.map(([t, p]) => {
+    const u = (p.last - p.entry) * p.shares;
+    return `<div class="brow"><span>${esc(p.o)} · ${p.strat} @ ${p.entry.toFixed(3)} ($${p.cost.toFixed(1)}) <span class="cd" data-end="${p.end}"></span></span><b class="${u >= 0 ? "pos" : "neg"}">${sgn(u)}</b></div>`;
+  }).join("") || `<div class="empty">No open BTC bets. Waiting for a window with edge.</div>`;
+  $("bLog").innerHTML = bt.log.filter(x => x.win !== null).slice(-8).reverse().map(x =>
+    `<div class="brow"><span>${x.t} · ${x.kind} ${esc(x.o)} @ ${(x.ask * 100).toFixed(0)}¢ (p ${(x.p * 100).toFixed(0)}%)</span><b class="${x.win ? "pos" : "neg"}">${x.win ? "WIN" : "LOSS"} ${sgn(x.pnl)}</b></div>`).join("") || `<div class="empty">Nothing settled yet.</div>`;
+}
+$("bEdge").onchange = () => { BC.edge = Math.max(0, parseFloat($("bEdge").value) || BDEF.edge); store("pb_bcfg", BC); };
+$("bBet").onchange = () => { BC.bet = Math.max(1, parseFloat($("bBet").value) || BDEF.bet); store("pb_bcfg", BC); };
+$("bLot").onchange = () => { BC.lot = Math.max(1, parseFloat($("bLot").value) || BDEF.lot); store("pb_bcfg", BC); };
+$("bLotBtn").onclick = () => { BC.lottery = BC.lottery ? 0 : 1; store("pb_bcfg", BC); renderBtc(); };
+$("bReset").onclick = () => { if (confirm("Reset the BTC desk?")) { bt = newBt(); store("pb_btc", bt); renderBtc(); } };
 function walkBuy(asks, usd) {
   let shares = 0, cost = 0;
   for (const [p, s] of asks) {
@@ -542,7 +667,7 @@ async function scan() {
     if (CFG.btc_on && btcCtx) {
       try {
         const bm = await fetchBtcMarkets();
-        markets.unshift(...bm);
+        await btcDesk(bm);
         st.btc = { S: btcCtx.S, n: bm.length };
         log(`BTC $${btcCtx.S.toFixed(0)} · vol ${(btcCtx.sig * 100).toFixed(3)}%/min · ${bm.length} up/down markets`);
       } catch (e) { log("BTC markets error: " + e.message); }
@@ -868,6 +993,7 @@ function render() {
     </div>`;
   }).join("") || `<div class="empty">Run a scan to see what the bot is looking at.</div>`;
 
+  renderBtc();
   drawChart(); drawHist();
   tick();
 }
