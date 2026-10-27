@@ -614,7 +614,7 @@ function renderBtc() {
   $("btcNote").textContent = `${nAll} settled · ${BC.on ? "on" : "off"}`;
   $("bLotBtn").textContent = "Lottery: " + (BC.lottery ? "on" : "off");
   $("bReset").textContent = "Reset " + bView;
-  BKINDS.forEach(k => { $("bTf" + k).textContent = k + ": " + (BC.tf[k] ? "on" : "off"); });
+  BKINDS.forEach(k => { $("bTf" + k.replace("m", "")).textContent = k + ": " + (BC.tf[k] ? "on" : "off"); });
   if (document.activeElement !== $("bEdge")) $("bEdge").value = BC.edge;
   if (document.activeElement !== $("bMin")) $("bMin").value = BC.minP;
   if (document.activeElement !== $("bMax")) $("bMax").value = BC.maxP;
