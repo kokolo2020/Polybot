@@ -470,8 +470,10 @@ const etSlug = (t, withYear) => {
 async function eventBySlug(slug) {
   try { const r = await getJSON(GAMMA + "/events", { slug }); return Array.isArray(r) ? r[0] : r; } catch (e) { return null; }
 }
+const btcDiag = {};   // per timeframe: markets found, why not, best edge seen (shown on each BTC desk)
 async function fetchBtcMarkets() {
   const now = Date.now(), out = [];
+  ["5m", "15m", "1h"].forEach(k => { btcDiag[k] = { found: 0, why: [], best: null }; });
   const jobs = [];
   const b15 = Math.floor(now / 900000) * 900, b5 = Math.floor(now / 300000) * 300;
   [0, 1].forEach(i => jobs.push({ kind: "5m", dur: 300e3, slugs: [`btc-updown-5m-${b5 + i * 300}`] }));
@@ -483,14 +485,16 @@ async function fetchBtcMarkets() {
   await Promise.all(jobs.map(async j => {
     let ev = null;
     for (const sl of j.slugs) { ev = await eventBySlug(sl); if (ev && ev.markets && ev.markets.length) break; ev = null; }
-    if (!ev) return;
+    const D = btcDiag[j.kind];
+    if (!ev) { D.why.push("no event " + j.slugs[0]); return; }
     const m = ev.markets[0];
     const tokens = parseList(m.clobTokenIds), outcomes = parseList(m.outcomes);
-    if (tokens.length !== 2 || outcomes.length !== 2 || m.closed) return;
+    if (tokens.length !== 2 || outcomes.length !== 2 || m.closed) { D.why.push("closed"); return; }
     const end = Date.parse(m.endDate || ev.endDate);
-    if (!end || end < now + 60e3) return;
+    if (!end || end < now + 60e3) { D.why.push("ending"); return; }
     const start = end - j.dur, K = btcCtx.open[Math.floor(start / 60000) * 60000];
-    if (!K) return;
+    if (!K) { D.why.push("not started"); return; }
+    D.found++;
     let upIdx = outcomes.findIndex(o => /^up$/i.test(o)); if (upIdx < 0) upIdx = 0;
     out.push({ q: (m.question || ev.title || j.kind + " BTC").slice(0, 90), tokens, outcomes, liq: parseFloat(m.liquidity || 0), end,
                btc: { kind: j.kind, K, upIdx } });
@@ -540,12 +544,13 @@ async function btcDesk(bm) {
     if (m.tokens.some(t => bt.positions[t])) continue;
     const tau = (m.end - Date.now()) / 60000;
     if (tau < 1.5) continue;
-    const pu = btcPUp(m.btc.K, m.end);
+    const pu = btcPUp(m.btc.K, m.end), D = btcDiag[kind];
     let best = null;
     for (let k = 0; k < 2; k++) {
       const bk = books[m.tokens[k]]; if (!bk || !bk[0].length || !bk[1].length) continue;
       const ask = bk[1][0][0], p = k === m.btc.upIdx ? pu : 1 - pu;
       const edge = p - ask - BFEE * ask * (1 - ask);
+      if (D && (!D.best || edge > D.best.edge)) D.best = { edge, ask, tau };
       let strat = null;
       if (ask >= C.minP && ask <= C.maxP && edge >= C.edge) strat = "model";
       else if (C.lottery && m.btc.kind === "15m" && tau <= 5 && ask < C.minP && edge >= 0.03) strat = "lottery";
@@ -593,6 +598,7 @@ function buildBtcCards() {
     <button class="red sm" data-f="reset">Reset desk</button>
   </div>
   <div class="k" style="margin-top:10px">CALIBRATION &middot; does the model's probability match reality?</div>
+  <div class="k" data-f="diag" style="margin-top:8px"></div>
   <div data-f="cal"></div>
   <div class="k" style="margin-top:10px">OPEN BTC BETS</div>
   <div data-f="pos"></div>
@@ -618,6 +624,10 @@ function renderBtc() {
     set("wr", n ? `${Math.round(bt.w / n * 100)}% (${bt.w}/${n})` : "-");
     set("fee", fmt(bt.fees)); set("open", String(pos.length)); set("spot", spot);
     set("note", `${n} settled · ${C.on ? "on" : "off"}`);
+    { const D = btcDiag[k];
+      set("diag", !D ? "Waiting for first scan..." : !C.on ? "Desk is off." :
+        D.found === 0 ? `No ${k} market found (${[...new Set(D.why)].join(", ") || "not scanned yet"}).` :
+        `Scanning ${D.found} market${D.found > 1 ? "s" : ""}` + (D.best ? ` · best edge ${(D.best.edge * 100).toFixed(1)}¢ @ ${(D.best.ask * 100).toFixed(0)}¢ (needs ≥ ${(C.edge * 100).toFixed(1)}¢, price ${C.minP}-${C.maxP})` : " · no book yet")); }
     set("on", C.on ? "On" : "Off");
     if (bq(k, "lotBtn")) set("lotBtn", "Lottery: " + (C.lottery ? "on" : "off"));
     ["edge", "minP", "maxP", "bet", "lot"].forEach(f => { const el = bq(k, f); if (el && document.activeElement !== el) el.value = C[f]; });
