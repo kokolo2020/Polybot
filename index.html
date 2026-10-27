@@ -205,7 +205,7 @@
 </div>
 
 <div class="card" id="btcCard">
-  <div class="ct"><h2>BTC desk &middot; 15m + 1h</h2><span class="k mono" id="btcNote">-</span></div>
+  <div class="ct"><h2>BTC desk &middot; 5m + 15m + 1h</h2><span class="k mono" id="btcNote">-</span></div>
   <div class="k" style="margin-bottom:8px">Separate $1,000 paper account. Taker fee on (7% rate), hold to settlement, every bet logged for calibration.</div>
   <div class="tiles">
     <div class="tile"><div class="k">Balance</div><div class="v" id="bEq">-</div></div>
@@ -316,7 +316,7 @@ const CFG_NOTES = {
   kelly_fraction: "Kelly fraction", max_pos_pct: "max % per position",
   take_profit: "take profit (price)", stop_loss: "stop loss (price)",
   min_liquidity: "min market liquidity $", max_open: "max open positions",
-  btc_on: "BTC 15m + 1h markets (1 = on, 0 = off)",
+  btc_on: "BTC 5m + 15m + 1h markets (1 = on, 0 = off)",
   max_hours: "only markets ending within N hours (0 = off)", markets_per_scan: "markets scanned per round"
 };
 const PRESETS = {
@@ -499,7 +499,8 @@ async function eventBySlug(slug) {
 async function fetchBtcMarkets() {
   const now = Date.now(), out = [];
   const jobs = [];
-  const b15 = Math.floor(now / 900000) * 900;
+  const b15 = Math.floor(now / 900000) * 900, b5 = Math.floor(now / 300000) * 300;
+  [0, 1].forEach(i => jobs.push({ kind: "5m", dur: 300e3, slugs: [`btc-updown-5m-${b5 + i * 300}`] }));
   [0, 1].forEach(i => jobs.push({ kind: "15m", dur: 900e3, slugs: [`btc-updown-15m-${b15 + i * 900}`] }));
   [0, 1].forEach(i => {
     const t = Math.floor((now + i * 3600e3) / 3600e3) * 3600e3;
