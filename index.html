@@ -204,37 +204,7 @@
   <div id="uLog"></div>
 </div>
 
-<div class="card" id="btcCard">
-  <div class="ct"><h2>BTC desk &middot; 5m + 15m + 1h</h2><span class="k mono" id="btcNote">-</span></div>
-  <div class="k" style="margin-bottom:8px">Three separate $1,000 paper accounts (5m / 15m / 1h). Tap a tab to view one. Taker fee on (7% rate), hold to settlement, every bet logged for calibration.</div>
-  <div class="row" id="bTabs" style="gap:8px;margin-bottom:8px"></div>
-  <div class="tiles">
-    <div class="tile"><div class="k">Balance</div><div class="v" id="bEq">-</div></div>
-    <div class="tile"><div class="k">Realized P&amp;L</div><div class="v" id="bReal">-</div></div>
-    <div class="tile"><div class="k">Win rate</div><div class="v" id="bWr">-</div></div>
-    <div class="tile"><div class="k">Fees paid</div><div class="v" id="bFee">-</div></div>
-    <div class="tile"><div class="k">Open</div><div class="v" id="bOpen">-</div></div>
-    <div class="tile"><div class="k">BTC spot</div><div class="v" id="bSpot">-</div></div>
-  </div>
-  <div class="row" style="margin-top:10px;gap:8px;align-items:end">
-    <label class="k">min edge <input id="bEdge" type="number" step="0.01" style="width:64px"></label>
-    <label class="k">min price <input id="bMin" type="number" step="0.01" style="width:64px"></label>
-    <label class="k">max price <input id="bMax" type="number" step="0.01" style="width:64px"></label>
-    <label class="k">bet $ <input id="bBet" type="number" style="width:64px"></label>
-    <label class="k">lottery $ <input id="bLot" type="number" style="width:64px"></label>
-    <button class="sec sm" id="bLotBtn">Lottery: on</button>
-    <button class="sec sm" id="bTf5">5m: on</button>
-    <button class="sec sm" id="bTf15">15m: on</button>
-    <button class="sec sm" id="bTf1h">1h: on</button>
-    <button class="red sm" id="bReset">Reset desk</button>
-  </div>
-  <div class="k" style="margin-top:10px">CALIBRATION &middot; does the model's probability match reality?</div>
-  <div id="bCal"></div>
-  <div class="k" style="margin-top:10px">OPEN BTC BETS</div>
-  <div id="bPos"></div>
-  <div class="k" style="margin-top:10px">LAST SETTLED</div>
-  <div id="bLog"></div>
-</div>
+<div id="btcDesks"></div>
 
 <div class="card">
   <div class="ct"><h2>Agent desk</h2><span class="k mono" id="stageTxt">idle</span></div>
@@ -530,18 +500,18 @@ async function fetchBtcMarkets() {
 
 // ---- BTC desk: separate paper account, fees on, hold to settlement, calibration log ----
 const BFEE = 0.07;
-const BDEF = { on: 1, edge: 0.04, bet: 20, lot: 5, lottery: 1, minP: 0.10, maxP: 0.90, tf: { "5m": 1, "15m": 1, "1h": 1 } };
-let BC = Object.assign({}, BDEF, store("pb_bcfg") || {});
-BC.tf = Object.assign({}, BDEF.tf, BC.tf || {});
 const newBt = () => ({ cash: 1000, start: 1000, positions: {}, realized: 0, w: 0, l: 0, fees: 0, log: [], curve: [] });
 const BKINDS = ["5m", "15m", "1h"];
 let bts = store("pb_btc3") || {};   // one separate $1,000 account per timeframe
 BKINDS.forEach(k => { if (!bts[k]) bts[k] = newBt(); });
-let bView = store("pb_bview"); if (!BKINDS.includes(bView)) bView = "15m";
+const BDEFK = { on: 1, edge: 0.04, bet: 20, lot: 5, lottery: 1, minP: 0.10, maxP: 0.90 };
+const BOLD = store("pb_bcfg") || {};   // old shared settings seed each desk once
+let BCs = store("pb_bcfg3") || {};
+BKINDS.forEach(k => { BCs[k] = Object.assign({}, BDEFK, BOLD, BCs[k] || {}); delete BCs[k].tf; });
 const bFee = (sh, px) => sh * BFEE * px * (1 - px);
 function bEquity(bt) { return bt.cash + Object.values(bt.positions).reduce((a, p) => a + p.shares * (p.last ?? p.entry), 0); }
 async function btcDesk(bm) {
-  if (!BC.on || !btcCtx) return;
+  if (!btcCtx) return;
   const now = clock();
   // settle expired windows in every account (approx via Binance 1m close; real resolution is Chainlink)
   for (const kind of BKINDS) {
@@ -565,8 +535,8 @@ async function btcDesk(bm) {
   Object.assign(allBooks, books);
   for (const k of BKINDS) for (const [tok, pos] of Object.entries(bts[k].positions)) { const b = books[tok]; if (b && b[0].length) pos.last = b[0][0][0]; }
   for (const m of bm) {
-    const kind = m.btc.kind, bt = bts[kind];
-    if (!bt || !BC.tf[kind]) continue;   // unknown timeframe or switched off
+    const kind = m.btc.kind, bt = bts[kind], C = BCs[kind];
+    if (!bt || !C || !C.on) continue;   // unknown timeframe or desk switched off
     if (m.tokens.some(t => bt.positions[t])) continue;
     const tau = (m.end - Date.now()) / 60000;
     if (tau < 1.5) continue;
@@ -577,12 +547,12 @@ async function btcDesk(bm) {
       const ask = bk[1][0][0], p = k === m.btc.upIdx ? pu : 1 - pu;
       const edge = p - ask - BFEE * ask * (1 - ask);
       let strat = null;
-      if (ask >= BC.minP && ask <= BC.maxP && edge >= BC.edge) strat = "model";
-      else if (BC.lottery && m.btc.kind === "15m" && tau <= 5 && ask < BC.minP && edge >= 0.03) strat = "lottery";
+      if (ask >= C.minP && ask <= C.maxP && edge >= C.edge) strat = "model";
+      else if (C.lottery && m.btc.kind === "15m" && tau <= 5 && ask < C.minP && edge >= 0.03) strat = "lottery";
       if (strat && (!best || edge > best.edge)) best = { k, ask, p, edge, strat, asks: bk[1], bids: bk[0] };
     }
     if (!best) continue;
-    const usd = Math.min(best.strat === "lottery" ? BC.lot : BC.bet, bt.cash);
+    const usd = Math.min(best.strat === "lottery" ? C.lot : C.bet, bt.cash);
     if (usd < 1) continue;
     const [shares, cost, avg] = walkBuy(best.asks, usd);
     if (shares <= 0) continue;
@@ -599,51 +569,76 @@ async function btcDesk(bm) {
   for (const k of BKINDS) { bts[k].curve.push([Date.now(), bEquity(bts[k])]); bts[k].curve = bts[k].curve.slice(-800); }
   store("pb_btc3", bts);
 }
-function renderBtc() {
-  const bt = bts[bView], eq = bEquity(bt), n = bt.w + bt.l, pos = Object.entries(bt.positions);
-  const nAll = BKINDS.reduce((a, k) => a + bts[k].w + bts[k].l, 0);
-  $("bTabs").innerHTML = BKINDS.map(k => { const e = bEquity(bts[k]);
-    return `<button class="sec sm" data-k="${k}" style="${k === bView ? "border-color:#9aa0c0;color:#fff" : ""}">${k} <span class="${e >= bts[k].start ? "pos" : "neg"}">${fmt(e)}</span></button>`; }).join("");
-  $("bTabs").querySelectorAll("button").forEach(b => { b.onclick = () => { bView = b.dataset.k; store("pb_bview", bView); renderBtc(); }; });
-  $("bEq").innerHTML = `<span class="${eq >= bt.start ? "pos" : "neg"}">${fmt(eq)}</span>`;
-  $("bReal").innerHTML = `<span class="${bt.realized >= 0 ? "pos" : "neg"}">${sgn(bt.realized)}</span>`;
-  $("bWr").textContent = n ? `${Math.round(bt.w / n * 100)}% (${bt.w}/${n})` : "-";
-  $("bFee").textContent = fmt(bt.fees);
-  $("bOpen").textContent = pos.length;
-  $("bSpot").textContent = st.btc ? "$" + Math.round(st.btc.S).toLocaleString() : "-";
-  $("btcNote").textContent = `${nAll} settled · ${BC.on ? "on" : "off"}`;
-  $("bLotBtn").textContent = "Lottery: " + (BC.lottery ? "on" : "off");
-  $("bReset").textContent = "Reset " + bView;
-  BKINDS.forEach(k => { $("bTf" + k.replace("m", "")).textContent = k + ": " + (BC.tf[k] ? "on" : "off"); });
-  if (document.activeElement !== $("bEdge")) $("bEdge").value = BC.edge;
-  if (document.activeElement !== $("bMin")) $("bMin").value = BC.minP;
-  if (document.activeElement !== $("bMax")) $("bMax").value = BC.maxP;
-  if (document.activeElement !== $("bBet")) $("bBet").value = BC.bet;
-  if (document.activeElement !== $("bLot")) $("bLot").value = BC.lot;
-  const rows = ["model", "lottery"].map(sname => {
-    const d = bt.log.filter(x => x.strat === sname && x.win !== null);
-    if (!d.length) return `<div class="bt"><span>${sname}</span><span>0</span><span>-</span><span>-</span><span>-</span></div>`;
-    const wr = d.filter(x => x.win).length / d.length * 100, mp = d.reduce((a, x) => a + x.p, 0) / d.length * 100,
-      ap = d.reduce((a, x) => a + x.ask, 0) / d.length * 100, pnl = d.reduce((a, x) => a + x.pnl, 0);
-    return `<div class="bt"><span>${sname}</span><span>${d.length}</span><span>${wr.toFixed(0)}%</span><span>${mp.toFixed(0)}% / ${ap.toFixed(0)}¢</span><b class="${pnl >= 0 ? "pos" : "neg"}">${sgn(pnl)}</b></div>`;
-  });
-  $("bCal").innerHTML = `<div class="bt h"><span>${bView} desk</span><span>n</span><span>won</span><span>model/paid</span><span>P&amp;L</span></div>` + rows.join("") +
-    `<div class="k" style="margin-top:4px">If "won" is well below "model", the model is overconfident. Judge after 100+ settled.</div>`;
-  $("bPos").innerHTML = pos.map(([t, p]) => {
-    const u = (p.last - p.entry) * p.shares;
-    return `<div class="brow"><span>${esc(p.o)} · ${p.strat} @ ${p.entry.toFixed(3)} ($${p.cost.toFixed(1)}) <span class="cd" data-end="${p.end}"></span></span><b class="${u >= 0 ? "pos" : "neg"}">${sgn(u)}</b></div>`;
-  }).join("") || `<div class="empty">No open ${bView} bets. Waiting for a window with edge.</div>`;
-  $("bLog").innerHTML = bt.log.filter(x => x.win !== null).slice(-8).reverse().map(x =>
-    `<div class="brow"><span>${x.t} · ${x.kind} ${esc(x.o)} @ ${(x.ask * 100).toFixed(0)}¢ (p ${(x.p * 100).toFixed(0)}%)</span><b class="${x.win ? "pos" : "neg"}">${x.win ? "WIN" : "LOSS"} ${sgn(x.pnl)}</b></div>`).join("") || `<div class="empty">Nothing settled yet.</div>`;
+const bq = (k, f) => document.querySelector(`#btc_${k} [data-f="${f}"]`);
+function buildBtcCards() {
+  $("btcDesks").innerHTML = BKINDS.map(k => `<div class="card" id="btc_${k}">
+  <div class="ct"><h2>BTC ${k} desk</h2><span class="k mono" data-f="note">-</span></div>
+  <div class="k" style="margin-bottom:8px">Separate $1,000 paper account for ${k} Up/Down markets. Taker fee on (7% rate), hold to settlement, every bet logged for calibration.</div>
+  <div class="tiles">
+    <div class="tile"><div class="k">Balance</div><div class="v" data-f="eq">-</div></div>
+    <div class="tile"><div class="k">Realized P&amp;L</div><div class="v" data-f="real">-</div></div>
+    <div class="tile"><div class="k">Win rate</div><div class="v" data-f="wr">-</div></div>
+    <div class="tile"><div class="k">Fees paid</div><div class="v" data-f="fee">-</div></div>
+    <div class="tile"><div class="k">Open</div><div class="v" data-f="open">-</div></div>
+    <div class="tile"><div class="k">BTC spot</div><div class="v" data-f="spot">-</div></div>
+  </div>
+  <div class="row" style="margin-top:10px;gap:8px;align-items:end">
+    <label class="k">min edge <input data-f="edge" type="number" step="0.01" style="width:64px"></label>
+    <label class="k">min price <input data-f="minP" type="number" step="0.01" style="width:64px"></label>
+    <label class="k">max price <input data-f="maxP" type="number" step="0.01" style="width:64px"></label>
+    <label class="k">bet $ <input data-f="bet" type="number" style="width:64px"></label>
+    ${k === "15m" ? `<label class="k">lottery $ <input data-f="lot" type="number" style="width:64px"></label>
+    <button class="sec sm" data-f="lotBtn">Lottery: on</button>` : ""}
+    <button class="sec sm" data-f="on">On</button>
+    <button class="red sm" data-f="reset">Reset desk</button>
+  </div>
+  <div class="k" style="margin-top:10px">CALIBRATION &middot; does the model's probability match reality?</div>
+  <div data-f="cal"></div>
+  <div class="k" style="margin-top:10px">OPEN BTC BETS</div>
+  <div data-f="pos"></div>
+  <div class="k" style="margin-top:10px">LAST SETTLED</div>
+  <div data-f="log"></div>
+</div>`).join("");
+  for (const k of BKINDS) {
+    const C = BCs[k], save = () => store("pb_bcfg3", BCs);
+    const num = (f, lo, hi) => { const el = bq(k, f); if (!el) return; el.onchange = () => { const v = parseFloat(el.value); C[f] = isNaN(v) ? BDEFK[f] : Math.min(hi, Math.max(lo, v)); save(); }; };
+    num("edge", 0, 1); num("minP", 0.01, 0.95); num("maxP", 0.02, 0.99); num("bet", 1, 1e6); num("lot", 1, 1e6);
+    bq(k, "on").onclick = () => { C.on = C.on ? 0 : 1; save(); renderBtc(); };
+    if (bq(k, "lotBtn")) bq(k, "lotBtn").onclick = () => { C.lottery = C.lottery ? 0 : 1; save(); renderBtc(); };
+    bq(k, "reset").onclick = () => { if (confirm(`Reset the BTC ${k} desk?`)) { bts[k] = newBt(); store("pb_btc3", bts); renderBtc(); } };
+  }
 }
-$("bEdge").onchange = () => { BC.edge = Math.max(0, parseFloat($("bEdge").value) || BDEF.edge); store("pb_bcfg", BC); };
-$("bMin").onchange = () => { BC.minP = Math.min(0.95, Math.max(0.01, parseFloat($("bMin").value) || BDEF.minP)); store("pb_bcfg", BC); };
-$("bMax").onchange = () => { BC.maxP = Math.min(0.99, Math.max(0.02, parseFloat($("bMax").value) || BDEF.maxP)); store("pb_bcfg", BC); };
-$("bBet").onchange = () => { BC.bet = Math.max(1, parseFloat($("bBet").value) || BDEF.bet); store("pb_bcfg", BC); };
-$("bLot").onchange = () => { BC.lot = Math.max(1, parseFloat($("bLot").value) || BDEF.lot); store("pb_bcfg", BC); };
-$("bLotBtn").onclick = () => { BC.lottery = BC.lottery ? 0 : 1; store("pb_bcfg", BC); renderBtc(); };
-[["bTf5", "5m"], ["bTf15", "15m"], ["bTf1h", "1h"]].forEach(([id, k]) => { $(id).onclick = () => { BC.tf[k] = BC.tf[k] ? 0 : 1; store("pb_bcfg", BC); renderBtc(); }; });
-$("bReset").onclick = () => { if (confirm("Reset the BTC " + bView + " desk?")) { bts[bView] = newBt(); store("pb_btc3", bts); renderBtc(); } };
+function renderBtc() {
+  const spot = st.btc ? "$" + Math.round(st.btc.S).toLocaleString() : "-";
+  for (const k of BKINDS) {
+    const bt = bts[k], C = BCs[k], eq = bEquity(bt), n = bt.w + bt.l, pos = Object.entries(bt.positions);
+    const set = (f, html) => { const el = bq(k, f); if (el) el.innerHTML = html; };
+    set("eq", `<span class="${eq >= bt.start ? "pos" : "neg"}">${fmt(eq)}</span>`);
+    set("real", `<span class="${bt.realized >= 0 ? "pos" : "neg"}">${sgn(bt.realized)}</span>`);
+    set("wr", n ? `${Math.round(bt.w / n * 100)}% (${bt.w}/${n})` : "-");
+    set("fee", fmt(bt.fees)); set("open", String(pos.length)); set("spot", spot);
+    set("note", `${n} settled · ${C.on ? "on" : "off"}`);
+    set("on", C.on ? "On" : "Off");
+    if (bq(k, "lotBtn")) set("lotBtn", "Lottery: " + (C.lottery ? "on" : "off"));
+    ["edge", "minP", "maxP", "bet", "lot"].forEach(f => { const el = bq(k, f); if (el && document.activeElement !== el) el.value = C[f]; });
+    const rows = ["model", "lottery"].map(sname => {
+      const d = bt.log.filter(x => x.strat === sname && x.win !== null);
+      if (!d.length) return `<div class="bt"><span>${sname}</span><span>0</span><span>-</span><span>-</span><span>-</span></div>`;
+      const wr = d.filter(x => x.win).length / d.length * 100, mp = d.reduce((a, x) => a + x.p, 0) / d.length * 100,
+        ap = d.reduce((a, x) => a + x.ask, 0) / d.length * 100, pnl = d.reduce((a, x) => a + x.pnl, 0);
+      return `<div class="bt"><span>${sname}</span><span>${d.length}</span><span>${wr.toFixed(0)}%</span><span>${mp.toFixed(0)}% / ${ap.toFixed(0)}¢</span><b class="${pnl >= 0 ? "pos" : "neg"}">${sgn(pnl)}</b></div>`;
+    });
+    set("cal", `<div class="bt h"><span>strategy</span><span>n</span><span>won</span><span>model/paid</span><span>P&amp;L</span></div>` + rows.join("") +
+      `<div class="k" style="margin-top:4px">If "won" is well below "model", the model is overconfident. Judge after 100+ settled.</div>`);
+    set("pos", pos.map(([t, p]) => {
+      const u = (p.last - p.entry) * p.shares;
+      return `<div class="brow"><span>${esc(p.o)} · ${p.strat} @ ${p.entry.toFixed(3)} ($${p.cost.toFixed(1)}) <span class="cd" data-end="${p.end}"></span></span><b class="${u >= 0 ? "pos" : "neg"}">${sgn(u)}</b></div>`;
+    }).join("") || `<div class="empty">No open ${k} bets. Waiting for a window with edge.</div>`);
+    set("log", bt.log.filter(x => x.win !== null).slice(-8).reverse().map(x =>
+      `<div class="brow"><span>${x.t} · ${esc(x.o)} @ ${(x.ask * 100).toFixed(0)}¢ (p ${(x.p * 100).toFixed(0)}%)</span><b class="${x.win ? "pos" : "neg"}">${x.win ? "WIN" : "LOSS"} ${sgn(x.pnl)}</b></div>`).join("") || `<div class="empty">Nothing settled yet.</div>`);
+  }
+}
+buildBtcCards();
 
 // ---- Underdog desk: always take the cheaper ("losing") side, $ flat, hold to resolution ----
 const UFEE = 0.05;   // assumed generic non-crypto taker rate (some categories differ)
