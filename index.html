@@ -206,7 +206,8 @@
 
 <div class="card" id="btcCard">
   <div class="ct"><h2>BTC desk &middot; 5m + 15m + 1h</h2><span class="k mono" id="btcNote">-</span></div>
-  <div class="k" style="margin-bottom:8px">Separate $1,000 paper account. Taker fee on (7% rate), hold to settlement, every bet logged for calibration.</div>
+  <div class="k" style="margin-bottom:8px">Three separate $1,000 paper accounts (5m / 15m / 1h). Tap a tab to view one. Taker fee on (7% rate), hold to settlement, every bet logged for calibration.</div>
+  <div class="row" id="bTabs" style="gap:8px;margin-bottom:8px"></div>
   <div class="tiles">
     <div class="tile"><div class="k">Balance</div><div class="v" id="bEq">-</div></div>
     <div class="tile"><div class="k">Realized P&amp;L</div><div class="v" id="bReal">-</div></div>
@@ -533,33 +534,40 @@ const BDEF = { on: 1, edge: 0.04, bet: 20, lot: 5, lottery: 1, minP: 0.10, maxP:
 let BC = Object.assign({}, BDEF, store("pb_bcfg") || {});
 BC.tf = Object.assign({}, BDEF.tf, BC.tf || {});
 const newBt = () => ({ cash: 1000, start: 1000, positions: {}, realized: 0, w: 0, l: 0, fees: 0, log: [], curve: [] });
-let bt = store("pb_btc") || newBt();
+const BKINDS = ["5m", "15m", "1h"];
+let bts = store("pb_btc3") || {};   // one separate $1,000 account per timeframe
+BKINDS.forEach(k => { if (!bts[k]) bts[k] = newBt(); });
+let bView = store("pb_bview"); if (!BKINDS.includes(bView)) bView = "15m";
 const bFee = (sh, px) => sh * BFEE * px * (1 - px);
-function bEquity() { return bt.cash + Object.values(bt.positions).reduce((a, p) => a + p.shares * (p.last ?? p.entry), 0); }
+function bEquity(bt) { return bt.cash + Object.values(bt.positions).reduce((a, p) => a + p.shares * (p.last ?? p.entry), 0); }
 async function btcDesk(bm) {
   if (!BC.on || !btcCtx) return;
   const now = clock();
-  // settle expired windows (approx via Binance 1m close; real resolution is Chainlink)
-  for (const [tok, pos] of Object.entries(bt.positions)) {
-    if (Date.now() < pos.end + 15000) continue;
-    const endPx = btcCtx.close[Math.floor((pos.end - 60000) / 60000) * 60000];
-    if (!endPx) continue;
-    const win = (endPx > pos.K) === pos.up, payout = win ? pos.shares : 0, pnl = payout - pos.cost;
-    bt.cash += payout; bt.realized += pnl; win ? bt.w++ : bt.l++;
-    const L = bt.log.find(x => x.tok === tok && x.win === null);
-    if (L) { L.win = win; L.pnl = pnl; L.endPx = endPx; }
-    delete bt.positions[tok];
-    log(`BTC desk ${win ? "WIN" : "LOSS"} ${sgn(pnl)} (${pos.o})`, "TRADE");
+  // settle expired windows in every account (approx via Binance 1m close; real resolution is Chainlink)
+  for (const kind of BKINDS) {
+    const bt = bts[kind];
+    for (const [tok, pos] of Object.entries(bt.positions)) {
+      if (Date.now() < pos.end + 15000) continue;
+      const endPx = btcCtx.close[Math.floor((pos.end - 60000) / 60000) * 60000];
+      if (!endPx) continue;
+      const win = (endPx > pos.K) === pos.up, payout = win ? pos.shares : 0, pnl = payout - pos.cost;
+      bt.cash += payout; bt.realized += pnl; win ? bt.w++ : bt.l++;
+      const L = bt.log.find(x => x.tok === tok && x.win === null);
+      if (L) { L.win = win; L.pnl = pnl; L.endPx = endPx; }
+      delete bt.positions[tok];
+      log(`BTC ${kind} desk ${win ? "WIN" : "LOSS"} ${sgn(pnl)} (${pos.o})`, "TRADE");
+    }
   }
   // books for markets + held tokens
-  const need = [...new Set([...bm.flatMap(m => m.tokens), ...Object.keys(bt.positions)])];
+  const need = [...new Set([...bm.flatMap(m => m.tokens), ...BKINDS.flatMap(k => Object.keys(bts[k].positions))])];
   const books = {};
   await Promise.all(need.map(async t => { try { books[t] = await fetchBook(t); } catch (e) { /* skip */ } }));
   Object.assign(allBooks, books);
-  for (const [tok, pos] of Object.entries(bt.positions)) { const b = books[tok]; if (b && b[0].length) pos.last = b[0][0][0]; }
+  for (const k of BKINDS) for (const [tok, pos] of Object.entries(bts[k].positions)) { const b = books[tok]; if (b && b[0].length) pos.last = b[0][0][0]; }
   for (const m of bm) {
+    const kind = m.btc.kind, bt = bts[kind];
+    if (!bt || !BC.tf[kind]) continue;   // unknown timeframe or switched off
     if (m.tokens.some(t => bt.positions[t])) continue;
-    if (!BC.tf[m.btc.kind]) continue;   // timeframe switched off
     const tau = (m.end - Date.now()) / 60000;
     if (tau < 1.5) continue;
     const pu = btcPUp(m.btc.K, m.end);
@@ -583,46 +591,48 @@ async function btcDesk(bm) {
     const tok = m.tokens[best.k], o = m.outcomes[best.k];
     bt.cash -= cost + fee; bt.fees += fee;
     bt.positions[tok] = { q: m.q, o, shares, entry: avg, cost: cost + fee, opened: now, end: m.end, K: m.btc.K, up: best.k === m.btc.upIdx, last: best.bids[0][0], strat: best.strat };
-    bt.log.push({ tok, t: now, strat: best.strat, kind: m.btc.kind, o, ask: avg, p: best.p, win: null, pnl: null });
+    bt.log.push({ tok, t: now, strat: best.strat, kind, o, ask: avg, p: best.p, win: null, pnl: null });
     bt.log = bt.log.slice(-400);
-    log(`BTC desk ${best.strat.toUpperCase()} ${o} @ ${avg.toFixed(3)} p=${best.p.toFixed(2)} ($${cost.toFixed(1)} + fee ${fee.toFixed(2)})`, "TRADE");
-    toast(`BTC ${best.strat}: ${o} @ ${avg.toFixed(2)}`, "BUY");
+    log(`BTC ${kind} desk ${best.strat.toUpperCase()} ${o} @ ${avg.toFixed(3)} p=${best.p.toFixed(2)} ($${cost.toFixed(1)} + fee ${fee.toFixed(2)})`, "TRADE");
+    toast(`BTC ${kind} ${best.strat}: ${o} @ ${avg.toFixed(2)}`, "BUY");
   }
-  bt.curve.push([Date.now(), bEquity()]); bt.curve = bt.curve.slice(-800);
-  store("pb_btc", bt);
+  for (const k of BKINDS) { bts[k].curve.push([Date.now(), bEquity(bts[k])]); bts[k].curve = bts[k].curve.slice(-800); }
+  store("pb_btc3", bts);
 }
 function renderBtc() {
-  const eq = bEquity(), n = bt.w + bt.l, pos = Object.entries(bt.positions);
+  const bt = bts[bView], eq = bEquity(bt), n = bt.w + bt.l, pos = Object.entries(bt.positions);
+  const nAll = BKINDS.reduce((a, k) => a + bts[k].w + bts[k].l, 0);
+  $("bTabs").innerHTML = BKINDS.map(k => { const e = bEquity(bts[k]);
+    return `<button class="sec sm" data-k="${k}" style="${k === bView ? "border-color:#9aa0c0;color:#fff" : ""}">${k} <span class="${e >= bts[k].start ? "pos" : "neg"}">${fmt(e)}</span></button>`; }).join("");
+  $("bTabs").querySelectorAll("button").forEach(b => { b.onclick = () => { bView = b.dataset.k; store("pb_bview", bView); renderBtc(); }; });
   $("bEq").innerHTML = `<span class="${eq >= bt.start ? "pos" : "neg"}">${fmt(eq)}</span>`;
   $("bReal").innerHTML = `<span class="${bt.realized >= 0 ? "pos" : "neg"}">${sgn(bt.realized)}</span>`;
   $("bWr").textContent = n ? `${Math.round(bt.w / n * 100)}% (${bt.w}/${n})` : "-";
   $("bFee").textContent = fmt(bt.fees);
   $("bOpen").textContent = pos.length;
   $("bSpot").textContent = st.btc ? "$" + Math.round(st.btc.S).toLocaleString() : "-";
-  $("btcNote").textContent = `${n} settled · ${BC.on ? "on" : "off"}`;
+  $("btcNote").textContent = `${nAll} settled · ${BC.on ? "on" : "off"}`;
   $("bLotBtn").textContent = "Lottery: " + (BC.lottery ? "on" : "off");
+  $("bReset").textContent = "Reset " + bView;
+  BKINDS.forEach(k => { $("bTf" + k).textContent = k + ": " + (BC.tf[k] ? "on" : "off"); });
   if (document.activeElement !== $("bEdge")) $("bEdge").value = BC.edge;
   if (document.activeElement !== $("bMin")) $("bMin").value = BC.minP;
   if (document.activeElement !== $("bMax")) $("bMax").value = BC.maxP;
   if (document.activeElement !== $("bBet")) $("bBet").value = BC.bet;
   if (document.activeElement !== $("bLot")) $("bLot").value = BC.lot;
-  const calRow = (name, pred) => {
-    const d = bt.log.filter(x => pred(x) && x.win !== null);
-    if (!d.length) return `<div class="bt"><span>${name}</span><span>0</span><span>-</span><span>-</span><span>-</span></div>`;
+  const rows = ["model", "lottery"].map(sname => {
+    const d = bt.log.filter(x => x.strat === sname && x.win !== null);
+    if (!d.length) return `<div class="bt"><span>${sname}</span><span>0</span><span>-</span><span>-</span><span>-</span></div>`;
     const wr = d.filter(x => x.win).length / d.length * 100, mp = d.reduce((a, x) => a + x.p, 0) / d.length * 100,
       ap = d.reduce((a, x) => a + x.ask, 0) / d.length * 100, pnl = d.reduce((a, x) => a + x.pnl, 0);
-    return `<div class="bt"><span>${name}</span><span>${d.length}</span><span>${wr.toFixed(0)}%</span><span>${mp.toFixed(0)}% / ${ap.toFixed(0)}¢</span><b class="${pnl >= 0 ? "pos" : "neg"}">${sgn(pnl)}</b></div>`;
-  };
-  const rows = ["model", "lottery"].map(s => calRow(s, x => x.strat === s));
-  const tfRows = ["5m", "15m", "1h"].map(k => calRow(k, x => x.kind === k));
-  [["bTf5", "5m"], ["bTf15", "15m"], ["bTf1h", "1h"]].forEach(([id, k]) => { $(id).textContent = k + ": " + (BC.tf[k] ? "on" : "off"); });
-  $("bCal").innerHTML = `<div class="bt h"><span>strategy</span><span>n</span><span>won</span><span>model/paid</span><span>P&amp;L</span></div>` + rows.join("") +
-    `<div class="bt h" style="margin-top:6px"><span>timeframe</span><span>n</span><span>won</span><span>model/paid</span><span>P&amp;L</span></div>` + tfRows.join("") +
+    return `<div class="bt"><span>${sname}</span><span>${d.length}</span><span>${wr.toFixed(0)}%</span><span>${mp.toFixed(0)}% / ${ap.toFixed(0)}¢</span><b class="${pnl >= 0 ? "pos" : "neg"}">${sgn(pnl)}</b></div>`;
+  });
+  $("bCal").innerHTML = `<div class="bt h"><span>${bView} desk</span><span>n</span><span>won</span><span>model/paid</span><span>P&amp;L</span></div>` + rows.join("") +
     `<div class="k" style="margin-top:4px">If "won" is well below "model", the model is overconfident. Judge after 100+ settled.</div>`;
   $("bPos").innerHTML = pos.map(([t, p]) => {
     const u = (p.last - p.entry) * p.shares;
     return `<div class="brow"><span>${esc(p.o)} · ${p.strat} @ ${p.entry.toFixed(3)} ($${p.cost.toFixed(1)}) <span class="cd" data-end="${p.end}"></span></span><b class="${u >= 0 ? "pos" : "neg"}">${sgn(u)}</b></div>`;
-  }).join("") || `<div class="empty">No open BTC bets. Waiting for a window with edge.</div>`;
+  }).join("") || `<div class="empty">No open ${bView} bets. Waiting for a window with edge.</div>`;
   $("bLog").innerHTML = bt.log.filter(x => x.win !== null).slice(-8).reverse().map(x =>
     `<div class="brow"><span>${x.t} · ${x.kind} ${esc(x.o)} @ ${(x.ask * 100).toFixed(0)}¢ (p ${(x.p * 100).toFixed(0)}%)</span><b class="${x.win ? "pos" : "neg"}">${x.win ? "WIN" : "LOSS"} ${sgn(x.pnl)}</b></div>`).join("") || `<div class="empty">Nothing settled yet.</div>`;
 }
@@ -633,7 +643,7 @@ $("bBet").onchange = () => { BC.bet = Math.max(1, parseFloat($("bBet").value) ||
 $("bLot").onchange = () => { BC.lot = Math.max(1, parseFloat($("bLot").value) || BDEF.lot); store("pb_bcfg", BC); };
 $("bLotBtn").onclick = () => { BC.lottery = BC.lottery ? 0 : 1; store("pb_bcfg", BC); renderBtc(); };
 [["bTf5", "5m"], ["bTf15", "15m"], ["bTf1h", "1h"]].forEach(([id, k]) => { $(id).onclick = () => { BC.tf[k] = BC.tf[k] ? 0 : 1; store("pb_bcfg", BC); renderBtc(); }; });
-$("bReset").onclick = () => { if (confirm("Reset the BTC desk?")) { bt = newBt(); store("pb_btc", bt); renderBtc(); } };
+$("bReset").onclick = () => { if (confirm("Reset the BTC " + bView + " desk?")) { bts[bView] = newBt(); store("pb_btc3", bts); renderBtc(); } };
 
 // ---- Underdog desk: always take the cheaper ("losing") side, $ flat, hold to resolution ----
 const UFEE = 0.05;   // assumed generic non-crypto taker rate (some categories differ)
