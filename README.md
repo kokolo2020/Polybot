@@ -20,3 +20,17 @@ Paper only. The signal is not a proven edge.
     journalctl -u polybot -f                              # live log
 
 State: `/opt/polybot/state.json`. Optional `/state.json` on port 8787.
+
+## Live test (friends, own accounts) - `python/polybot_live.py`
+For people **outside** restricted countries only, on their **own** Polymarket account with their **own** money.
+It checks Polymarket's geoblock endpoint and refuses to trade if blocked. Never share a private key with anyone.
+The paper edge is NOT proven. Treat any real money as money you can lose.
+
+1. **Dry run first (no keys, no money), 3+ days:** `python3 python/polybot_live.py --kinds 15m,5m`
+   Logs what it WOULD buy and, later, Polymarket's real result for each bet (`python/live_log.csv`).
+2. **Live, tiny:** `pip install polymarket-client` (package name per Polymarket's docs), then set
+   `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`, `POLYBOT_CONFIRM_LIVE=yes`; fund $20-50 only (use a session key if you can).
+3. **Before the first live bet:** `python3 python/polybot_live.py --probe <market-slug>` and send the output. The docs only show yes/no
+   markets, so the Up/Down asset mapping is unverified until this runs once.
+4. `python3 python/polybot_live.py --live --stake 5 --max-daily-loss 20 --kinds 15m`
+5. Stop anytime: create a file named `STOP` next to the script. Hard cap: $25 per bet.
