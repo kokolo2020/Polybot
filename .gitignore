@@ -2,3 +2,4 @@ python/live_state.json
 python/live_log.csv
 python/STOP
 __pycache__/
+python/data/

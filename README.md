@@ -34,3 +34,12 @@ The paper edge is NOT proven. Treat any real money as money you can lose.
    markets, so the Up/Down asset mapping is unverified until this runs once.
 4. `python3 python/polybot_live.py --live --stake 5 --max-daily-loss 20 --kinds 15m`
 5. Stop anytime: create a file named `STOP` next to the script. Hard cap: $25 per bet.
+
+## Data collector - `python/collect.py` (read-only, no keys, places no bets)
+Logs every BTC 5m/15m window every ~30s (Polymarket prices + book top, Binance spot/strike/volatility, time left)
+and Polymarket's real result afterwards, to `python/data/`. Betting only teaches us about the bets we picked;
+this builds an unbiased dataset to test ideas out-of-sample. Also saves any price-like fields Polymarket
+exposes (e.g. a "price to beat") to `meta.jsonl`.
+
+    git clone https://github.com/kokolo2020/Polybot && cd Polybot
+    python3 python/collect.py          # leave running; Ctrl-C to stop, safe to restart
