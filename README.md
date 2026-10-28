@@ -39,7 +39,9 @@ The paper edge is NOT proven. Treat any real money as money you can lose.
 Logs every BTC 5m/15m window every ~30s (Polymarket prices + book top, Binance spot/strike/volatility, time left)
 and Polymarket's real result afterwards, to `python/data/`. Betting only teaches us about the bets we picked;
 this builds an unbiased dataset to test ideas out-of-sample. Also saves any price-like fields Polymarket
-exposes (e.g. a "price to beat") to `meta.jsonl`.
+exposes to `meta.jsonl`. It also logs Polymarket's own start price ("price to beat") and close price per window
+(`pm_open`, `pm_close`, from polymarket.com/api/crypto/crypto-price; variant `fiveminute` for 5m, `fifteen` for 15m).
+Needs only Python 3 (no installs). Reading data works from Thailand; it never trades.
 
     git clone https://github.com/kokolo2020/Polybot && cd Polybot
     python3 python/collect.py          # leave running; Ctrl-C to stop, safe to restart

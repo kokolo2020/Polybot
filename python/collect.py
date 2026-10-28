@@ -22,13 +22,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 SNAP, RES, META, STATE = (os.path.join(DATA, f) for f in ("snapshots.csv", "results.csv", "meta.jsonl", "state.json"))
 SNAP_COLS = ["iso", "t_ms", "kind", "slug", "start_ms", "end_ms", "tau_min", "K_binance", "S", "sig",
-             "up_bid", "up_ask", "up_ask_sz", "dn_bid", "dn_ask", "dn_ask_sz"]
+             "up_bid", "up_ask", "up_ask_sz", "dn_bid", "dn_ask", "dn_ask_sz", "pm_open", "pm_close"]
+RES_COLS = ["slug", "end_ms", "up_won", "pm_open", "pm_close"]
+PM = "https://polymarket.com/api/crypto/crypto-price"
 
 
 def get(url, params=None, timeout=12):
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "polybot-collect/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; polybot-collect/1.1)"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
@@ -61,6 +63,18 @@ def top_of_book(token):
     asks = sorted((float(x["price"]), float(x["size"])) for x in b.get("asks", []))
     bids = sorted(((float(x["price"]), float(x["size"])) for x in b.get("bids", [])), reverse=True)
     return (bids[0][0] if bids else None), (asks[0][0] if asks else None), (asks[0][1] if asks else None)
+
+
+def pm_price(kind, start_s, end_s):
+    """Polymarket's own start ('price to beat') and close price for a window - the data the market settles on.
+    Needs variant=fiveminute for 5m and fifteen for 15m (other names return a stale wrong price)."""
+    iso = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        r = get(PM, {"symbol": "BTC", "eventStartTime": iso(start_s), "variant": "fiveminute" if kind == "5m" else "fifteen",
+                     "endDate": iso(end_s)})
+        return r.get("openPrice"), r.get("closePrice"), bool(r.get("completed"))
+    except Exception:
+        return None, None, False
 
 
 def price_like(obj, path=""):
@@ -125,11 +139,13 @@ def snapshot(kinds, ctx, st):
             continue
         end_ms, start_ms = (start + dur) * 1000, start * 1000
         K = ctx["open"].get(start_ms // 60000 * 60000, "")
+        pmo, pmc, _ = pm_price(kind, start, start + dur)
         tau = round((end_ms - now * 1000) / 60000, 3)
         append_csv(SNAP, SNAP_COLS, [datetime.now(timezone.utc).isoformat(timespec="seconds"), int(now * 1000), kind, slug, start_ms, end_ms, tau,
-                                     K, ctx["S"], round(ctx["sig"], 6), ub, ua, uas, db, da, das])
+                                     K, ctx["S"], round(ctx["sig"], 6), ub, ua, uas, db, da, das,
+                                     "" if pmo is None else pmo, "" if pmc is None else pmc])
         n += 1
-        st["open"][slug] = {"end_ms": end_ms, "up": up}
+        st["open"][slug] = {"end_ms": end_ms, "up": up, "kind": kind, "start": start, "dur": dur}
         if slug not in st["meta_seen"]:
             st["meta_seen"].append(slug)
             st["meta_seen"] = st["meta_seen"][-50:]
@@ -156,7 +172,12 @@ def resolve(st):
                 continue
         except Exception:
             continue
-        append_csv(RES, ["slug", "end_ms", "up_won"], [slug, w["end_ms"], int(prices[w["up"]] >= 0.5)])
+        pmo = pmc = ""
+        if w.get("kind"):
+            o, c, done = pm_price(w["kind"], w["start"], w["start"] + w["dur"])
+            if done:
+                pmo, pmc = o, c
+        append_csv(RES, RES_COLS, [slug, w["end_ms"], int(prices[w["up"]] >= 0.5), pmo, pmc])
         del st["open"][slug]
         say(f"result {slug}: Up {'WON' if prices[w['up']] >= 0.5 else 'lost'}")
 
