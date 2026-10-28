@@ -272,8 +272,8 @@
 </div>
 
 <script>
-const VERSION = "v2.9.1";
-const BUILD = "2026-10-28 20:20";
+const VERSION = "v2.10";
+const BUILD = "2026-10-28 21:30";
 const ON_WEB = location.protocol.startsWith("http");
 const BIN = ON_WEB ? "/binance" : "https://data-api.binance.vision";
 const GAMMA = ON_WEB ? "/gamma" : "https://gamma-api.polymarket.com";
@@ -470,6 +470,19 @@ const etSlug = (t, withYear) => {
 async function eventBySlug(slug) {
   try { const r = await getJSON(GAMMA + "/events", { slug }); return Array.isArray(r) ? r[0] : r; } catch (e) { return null; }
 }
+// Polymarket's own "price to beat" (what the site shows): public call, same data the market settles against
+const pmOpenCache = {};
+async function pmOpen(kind, start, end) {
+  const key = kind + start;
+  if (pmOpenCache[key]) return pmOpenCache[key];
+  const iso = t => new Date(t).toISOString().replace(".000Z", "Z");
+  try {
+    const r = await getJSON("/pmapi/crypto/crypto-price", { symbol: "BTC", eventStartTime: iso(start), variant: kind === "5m" ? "fiveminute" : "fifteen", endDate: iso(end) });
+    const v = r && Number(r.openPrice);
+    if (v > 1000) { pmOpenCache[key] = v; return v; }
+  } catch (e) {}
+  return null;
+}
 const btcRules = store("pb_btcrules") || {};   // each desk's market rules text (resolution source, tie rule)
 const btcDiag = {};   // per timeframe: markets found, why not, best edge seen (shown on each BTC desk)
 async function fetchBtcMarkets() {
@@ -493,14 +506,17 @@ async function fetchBtcMarkets() {
     if (tokens.length !== 2 || outcomes.length !== 2 || m.closed) { D.why.push("closed"); return; }
     const end = Date.parse(m.endDate || ev.endDate);
     if (!end || end < now + 60e3) { D.why.push("ending"); return; }
-    const start = end - j.dur, K = btcCtx.open[Math.floor(start / 60000) * 60000];
-    if (!K) { D.why.push("not started"); return; }
+    const start = end - j.dur, Kb = btcCtx.open[Math.floor(start / 60000) * 60000];
+    if (!Kb) { D.why.push("not started"); return; }
+    let K = Kb, Ksrc = "bn";
+    const pmo = (j.kind === "5m" || j.kind === "15m") ? await pmOpen(j.kind, start, end) : null;
+    if (pmo) { K = pmo; Ksrc = "pm"; } else if (j.kind !== "1h") D.why.push("PM start price n/a, using Binance");
     D.found++;
     { const rs = { src: m.resolutionSource || ev.resolutionSource || "", text: String(m.description || ev.description || "").slice(0, 1500) };
       if (rs.text && JSON.stringify(btcRules[j.kind]) !== JSON.stringify(rs)) { btcRules[j.kind] = rs; store("pb_btcrules", btcRules); } }
     let upIdx = outcomes.findIndex(o => /^up$/i.test(o)); if (upIdx < 0) upIdx = 0;
     out.push({ q: (m.question || ev.title || j.kind + " BTC").slice(0, 90), tokens, outcomes, liq: parseFloat(m.liquidity || 0), end,
-               btc: { kind: j.kind, K, upIdx } });
+               btc: { kind: j.kind, K, Kb, Ksrc, upIdx } });
   }));
   return out;
 }
@@ -614,7 +630,7 @@ async function btcDesk(bm) {
     bt.cash -= cost + fee; bt.fees += fee;
     bt.positions[tok] = { q: m.q, o, shares, entry: avg, cost: cost + fee, opened: now, end: m.end, K: m.btc.K, up: best.k === m.btc.upIdx, last: best.bids[0][0], strat: best.strat };
     bt.log.push({ tok, t: now, strat: best.strat, kind, o, ask: avg, ask0: best.ask, usd: cost, p: best.p, win: null, pnl: null,
-      up: best.k === m.btc.upIdx, K: m.btc.K, S0: btcCtx.S, sg: btcCtx.sig, en: m.end });   // v2.9: window data for testing which settlement rule Polymarket uses
+      up: best.k === m.btc.upIdx, K: m.btc.K, Kb: m.btc.Kb, Ks: m.btc.Ksrc, S0: btcCtx.S, sg: btcCtx.sig, en: m.end });   // v2.9: window data for testing which settlement rule Polymarket uses
     bt.log = bt.log.slice(-400);
     log(`BTC ${kind} desk ${best.strat.toUpperCase()} ${o} @ ${avg.toFixed(3)} p=${best.p.toFixed(2)} ($${cost.toFixed(1)} + fee ${fee.toFixed(2)})`, "TRADE");
     toast(`BTC ${kind} ${best.strat}: ${o} @ ${avg.toFixed(2)}`, "BUY");
@@ -693,9 +709,9 @@ function buildBtcCards() {
     if (bq(k, "lotBtn")) bq(k, "lotBtn").onclick = () => { C.lottery = C.lottery ? 0 : 1; save(); renderBtc(); };
     bq(k, "csv").onclick = async () => {
       // every verified bet (old ones have no window data: those columns stay empty)
-      const rows = [["kind", "time", "strat", "up", "ask", "p", "K", "S0", "sg", "en", "pm", "binWin", "px"]];
+      const rows = [["kind", "time", "strat", "up", "ask", "p", "K", "S0", "sg", "en", "pm", "binWin", "px", "Kb", "Ks"]];
       bts[k].log.filter(x => x.pm === "win" || x.pm === "loss").forEach(x => rows.push([k, String(x.t).replace(/,/g, ""), x.strat, x.up == null ? "" : (x.up ? 1 : 0), x.ask.toFixed(4), x.p.toFixed(3),
-        x.K ?? "", x.S0 ?? "", x.sg != null ? x.sg.toFixed(6) : "", x.en ?? "", x.pm, x.binWin == null ? "" : (x.binWin ? "win" : "loss"), x.px ? x.px.join("|") : ""]));
+        x.K ?? "", x.S0 ?? "", x.sg != null ? x.sg.toFixed(6) : "", x.en ?? "", x.pm, x.binWin == null ? "" : (x.binWin ? "win" : "loss"), x.px ? x.px.join("|") : "", x.Kb ?? "", x.Ks ?? ""]));
       const txt = rows.map(r => r.join(",")).join("\n"), box = bq(k, "csvbox");
       try { await navigator.clipboard.writeText(txt); toast(`Copied ${rows.length - 1} bets`, "BUY"); box.style.display = "none"; }
       catch (e) { box.value = txt; box.style.display = "block"; box.select(); toast("Select all and copy the box below", "BUY"); }
