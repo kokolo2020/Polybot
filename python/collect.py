@@ -9,7 +9,7 @@ real result. A few days gives thousands of unbiased labelled snapshots to test i
   python3 collect.py                 # runs forever, Ctrl-C to stop (safe to restart)
   python3 collect.py --once          # one pass
 
-Files (python/data/): snapshots.csv, results.csv, meta.jsonl (price-like fields in Polymarket's event JSON),
+Files (python/data/): maker.csv (paper maker fills), snapshots.csv, results.csv, meta.jsonl (price-like fields in Polymarket's event JSON),
 state.json (unresolved windows).
 """
 import argparse, csv, json, math, os, sys, time, urllib.parse, urllib.request
@@ -24,6 +24,10 @@ SNAP, RES, META, STATE = (os.path.join(DATA, f) for f in ("snapshots.csv", "resu
 SNAP_COLS = ["iso", "t_ms", "kind", "slug", "start_ms", "end_ms", "tau_min", "K_binance", "S", "sig",
              "up_bid", "up_ask", "up_ask_sz", "dn_bid", "dn_ask", "dn_ask_sz", "pm_open", "pm_close"]
 RES_COLS = ["slug", "end_ms", "up_won", "pm_open", "pm_close"]
+MK = os.path.join(DATA, "maker.csv")
+MK_COLS = ["slug", "kind", "off", "side", "quote", "fill_strict", "fill_touch", "up_won", "n_trades"]
+OFFSETS = (0.0, 0.01, 0.02)   # hypothetical resting bids: join best bid, 1c below, 2c below
+DATAAPI = "https://data-api.polymarket.com"
 PM = "https://polymarket.com/api/crypto/crypto-price"
 
 
@@ -145,7 +149,12 @@ def snapshot(kinds, ctx, st):
                                      K, ctx["S"], round(ctx["sig"], 6), ub, ua, uas, db, da, das,
                                      "" if pmo is None else pmo, "" if pmc is None else pmc])
         n += 1
-        st["open"][slug] = {"end_ms": end_ms, "up": up, "kind": kind, "start": start, "dur": dur}
+        prev = st["open"].get(slug, {})
+        mk = prev.get("mk")
+        if mk is None and ub and db and tau > dur / 60 - 1.0:   # first look in the window's first minute: post paper bids
+            mk = {"t": int(now), "cond": m.get("conditionId"), "tok": [tokens[up], tokens[dn]],
+                  "q": {str(o): [round(ub - o, 2), round(db - o, 2)] for o in OFFSETS}}
+        st["open"][slug] = {"end_ms": end_ms, "up": up, "kind": kind, "start": start, "dur": dur, "mk": mk}
         if slug not in st["meta_seen"]:
             st["meta_seen"].append(slug)
             st["meta_seen"] = st["meta_seen"][-50:]
@@ -153,6 +162,37 @@ def snapshot(kinds, ctx, st):
                 f.write(json.dumps({"slug": slug, "event": price_like(ev), "market": price_like(m),
                                     "description": str(m.get("description", ""))[:300]}) + "\n")
     return n
+
+
+def maker_sim(slug, w, up_won):
+    """PAPER maker test, no orders placed. We pretend to rest bids on Up and Down in the window's first minute and
+    ask: would anyone have traded THROUGH our price before the last 30s? Strict = a trade printed below our bid
+    (we'd surely have filled); touch = at or below (optimistic, ignores queue). Side-agnostic on purpose."""
+    mk = w.get("mk")
+    if not mk or not mk.get("cond"):
+        return
+    tr = get(DATAAPI + "/trades", {"market": mk["cond"], "limit": 1000})
+    tr = tr if isinstance(tr, list) else tr.get("data", [])
+    if tr and not os.path.exists(os.path.join(DATA, "trades_sample.json")):
+        with open(os.path.join(DATA, "trades_sample.json"), "w") as f:
+            json.dump(tr[:3], f)
+    t0, t1 = mk["t"], w["end_ms"] / 1000 - 30
+    seen = {0: [], 1: []}
+    for x in tr:
+        try:
+            ts, px, a = float(x["timestamp"]), float(x["price"]), str(x["asset"])
+        except Exception:
+            continue
+        if ts > 1e12:
+            ts /= 1000
+        if t0 <= ts <= t1 and a in mk["tok"]:
+            seen[mk["tok"].index(a)].append(px)
+    for o, (qu, qd) in mk["q"].items():
+        for side, q, px in (("up", qu, seen[0]), ("down", qd, seen[1])):
+            if q is None or q <= 0:
+                continue
+            append_csv(MK, MK_COLS, [slug, w["kind"], o, side, q, int(any(p < q for p in px)),
+                                    int(any(p <= q for p in px)), up_won, len(px)])
 
 
 def resolve(st):
@@ -178,6 +218,10 @@ def resolve(st):
             if done:
                 pmo, pmc = o, c
         append_csv(RES, RES_COLS, [slug, w["end_ms"], int(prices[w["up"]] >= 0.5), pmo, pmc])
+        try:
+            maker_sim(slug, w, int(prices[w["up"]] >= 0.5))
+        except Exception as e:
+            say(f"maker sim {slug}: skipped ({e})")
         del st["open"][slug]
         say(f"result {slug}: Up {'WON' if prices[w['up']] >= 0.5 else 'lost'}")
 
