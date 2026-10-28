@@ -272,8 +272,8 @@
 </div>
 
 <script>
-const VERSION = "v2.7";
-const BUILD = "2026-10-28 17:40";
+const VERSION = "v2.8";
+const BUILD = "2026-10-28 18:15";
 const ON_WEB = location.protocol.startsWith("http");
 const BIN = ON_WEB ? "/binance" : "https://data-api.binance.vision";
 const GAMMA = ON_WEB ? "/gamma" : "https://gamma-api.polymarket.com";
@@ -521,11 +521,27 @@ BKINDS.forEach(k => { BCs[k] = Object.assign({}, BDEFK, BOLD, BCs[k] || {}); del
 const bFee = (sh, px) => sh * BFEE * px * (1 - px);
 // cost (incl. fee) of a settled log entry, derived from its P&L so it also works for entries logged before v2.7
 const bUnit = x => x.ask + BFEE * x.ask * (1 - x.ask);
-const bCostOf = x => { const c = bUnit(x); return x.win ? x.pnl * c / (1 - c) : -x.pnl; };
+const bCostOf = x => { if (x.cost0 != null) return x.cost0; const c = bUnit(x); return x.win ? x.pnl * c / (1 - c) : -x.pnl; };
 const bRoiTxt = d => { const stk = d.reduce((a, x) => a + bCostOf(x), 0); if (!(stk > 0)) return "-"; const r = d.reduce((a, x) => a + x.pnl, 0) / stk * 100; return (r >= 0 ? "+" : "") + r.toFixed(0) + "%"; };
 // what the same bet would have made if it had settled the way Polymarket says it did
 const bPmPnl = x => { const cost = bCostOf(x), shares = cost / bUnit(x); return x.pm === "win" ? shares - cost : -cost; };
-const bMismatch = x => (x.pm === "win" || x.pm === "loss") && (x.pm === "win") !== x.win;
+const bMismatch = x => !!x.fixed;   // desk's Binance result was wrong and has been restated to Polymarket's
+const bNeedsFix = x => !x.fixed && (x.pm === "win" || x.pm === "loss") && (x.pm === "win") !== x.win;
+// Polymarket's result is the truth: restate the bet and the account (cash, realized P&L, wins/losses)
+function bRestate() {
+  for (const k of BKINDS) {
+    const bt = bts[k];
+    for (const x of bt.log) {
+      if (x.win === null || !bNeedsFix(x)) continue;
+      const cost = bCostOf(x), shares = cost / bUnit(x), newWin = x.pm === "win", newPnl = newWin ? shares - cost : -cost, d = newPnl - x.pnl;
+      x.cost0 = cost; x.binWin = x.win; x.binPnl = x.pnl; x.fixed = true;
+      x.win = newWin; x.pnl = newPnl;
+      bt.cash += d; bt.realized += d;
+      if (newWin) { bt.w++; bt.l--; } else { bt.l++; bt.w--; }
+      log(`BTC ${k} desk restated to Polymarket: ${x.o} @ ${(x.ask * 100).toFixed(0)}¢ ${x.binWin ? "WIN" : "LOSS"} -> ${newWin ? "WIN" : "LOSS"} (${sgn(d)})`, "SYS");
+    }
+  }
+}
 function bEquity(bt) { return bt.cash + Object.values(bt.positions).reduce((a, p) => a + p.shares * (p.last ?? p.entry), 0); }
 async function btcDesk(bm) {
   if (!btcCtx) return;
@@ -602,6 +618,7 @@ async function btcDesk(bm) {
 }
 // Check every settled bet against Polymarket's own result (free Gamma API, no keys). Newest first, a few per scan.
 async function btcVerify() {
+  bRestate();   // entries verified by v2.7 before restatement existed
   const now = Date.now(), batch = [];
   for (const k of BKINDS) {
     let n = 0;
@@ -620,11 +637,11 @@ async function btcVerify() {
       if (done && idx >= 0 && prices.length === 2 && !prices.some(isNaN)) {
         if (Math.max(...prices) >= 0.98) x.pm = prices[idx] >= 0.5 ? "win" : "loss";
         else if (prices.every(q => Math.abs(q - 0.5) < 0.03)) x.pm = "void";
-        if (bMismatch(x)) log(`BTC ${k} desk MISMATCH: desk said ${x.win ? "WIN" : "LOSS"}, Polymarket says ${x.pm.toUpperCase()} (${x.o} @ ${(x.ask * 100).toFixed(0)}¢)`, "SYS");
       }
     } catch (e) { /* retry next scan */ }
     if (!x.pm && x.pmTry >= 40) x.pm = "na";   // never resolved or not found: stop asking
   }));
+  bRestate();
   store("pb_btc3", bts);
 }
 const bq = (k, f) => document.querySelector(`#btc_${k} [data-f="${f}"]`);
@@ -717,10 +734,10 @@ function renderBtc() {
     const sk = bt.skips || { thin: 0, slip: 0, edge: 0 };
     const chk = settled.filter(x => x.pm === "win" || x.pm === "loss"), mism = chk.filter(bMismatch);
     const pend = settled.filter(x => !x.pm).length, unres = settled.filter(x => x.pm === "na" || x.pm === "void").length;
-    const deskP = chk.reduce((a, x) => a + x.pnl, 0), pmP = chk.reduce((a, x) => a + bPmPnl(x), 0);
-    const pmBlock = `<div class="k" style="margin-top:8px">POLYMARKET CHECK &middot; ${chk.length} verified &middot; <b class="${mism.length ? "neg" : "pos"}">${mism.length} mismatch${mism.length === 1 ? "" : "es"}</b> &middot; ${pend} pending${unres ? ` &middot; ${unres} unresolved/void` : ""}</div>` +
-      (chk.length ? `<div class="k" style="margin-top:4px">Same ${chk.length} bets: desk (Binance) <b class="${deskP >= 0 ? "pos" : "neg"}">${sgn(deskP)}</b> &middot; by Polymarket result <b class="${pmP >= 0 ? "pos" : "neg"}">${sgn(pmP)}</b></div>` : "") +
-      mism.slice(-3).reverse().map(x => `<div class="k" style="margin-top:2px">${esc(x.t)} &middot; ${esc(x.o)} @ ${(x.ask * 100).toFixed(0)}¢: desk ${x.win ? "WIN" : "LOSS"}, Polymarket ${x.pm.toUpperCase()}</div>`).join("");
+    const deskP = chk.reduce((a, x) => a + (x.fixed ? x.binPnl : x.pnl), 0), pmP = chk.reduce((a, x) => a + x.pnl, 0);   // pnl is already Polymarket-based once verified
+    const pmBlock = `<div class="k" style="margin-top:8px">POLYMARKET CHECK &middot; ${chk.length} verified &middot; <b class="${mism.length ? "neg" : "pos"}">${mism.length} restated</b> &middot; ${pend} still on Binance result (pending)${unres ? ` &middot; ${unres} unresolved/void` : ""}</div>` +
+      (chk.length ? `<div class="k" style="margin-top:4px">Same ${chk.length} bets: Binance result would have been <b class="${deskP >= 0 ? "pos" : "neg"}">${sgn(deskP)}</b> &middot; Polymarket result (now in your balance) <b class="${pmP >= 0 ? "pos" : "neg"}">${sgn(pmP)}</b></div>` : "") +
+      mism.slice(-3).reverse().map(x => `<div class="k" style="margin-top:2px">${esc(x.t)} &middot; ${esc(x.o)} @ ${(x.ask * 100).toFixed(0)}¢: Binance said ${x.binWin ? "WIN" : "LOSS"}, Polymarket ${x.pm.toUpperCase()} (restated)</div>`).join("");
     { const R = btcRules[k], el = bq(k, "rules"), key = R ? R.src + "|" + R.text : "";
       if (el && el.dataset.key !== key) { el.dataset.key = key;
         el.innerHTML = R ? `<details style="margin-top:8px"><summary class="k" style="cursor:pointer">How this market settles (Polymarket's rules text)</summary><div class="k" style="white-space:pre-wrap;margin-top:6px">${R.src ? "Source: " + esc(R.src) + "\n\n" : ""}${esc(R.text)}</div></details>` : ""; } }
