@@ -26,7 +26,7 @@
   .tkin{display:inline-block;padding:6px 0;font:600 11px ui-monospace,Menlo,monospace;color:var(--mut);animation:tk 38s linear infinite}
   .tkin b{color:var(--tx)}
   @keyframes tk{to{transform:translateX(-50%)}}
-  .bt{display:grid;grid-template-columns:1.1fr .5fr .7fr .7fr .9fr;gap:6px;font:11px ui-monospace,monospace;padding:4px 0;border-bottom:1px solid var(--line)}
+  .bt{display:grid;grid-template-columns:1.1fr .5fr .7fr .7fr .9fr .6fr;gap:6px;font:11px ui-monospace,monospace;padding:4px 0;border-bottom:1px solid var(--line)}
   .bt.h{color:var(--mut)}
   .brow{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:12px}
   .ct.clk{cursor:pointer;user-select:none}
@@ -272,8 +272,8 @@
 </div>
 
 <script>
-const VERSION = "v2.6";
-const BUILD = "2026-10-28 10:20";
+const VERSION = "v2.7";
+const BUILD = "2026-10-28 17:40";
 const ON_WEB = location.protocol.startsWith("http");
 const BIN = ON_WEB ? "/binance" : "https://data-api.binance.vision";
 const GAMMA = ON_WEB ? "/gamma" : "https://gamma-api.polymarket.com";
@@ -470,6 +470,7 @@ const etSlug = (t, withYear) => {
 async function eventBySlug(slug) {
   try { const r = await getJSON(GAMMA + "/events", { slug }); return Array.isArray(r) ? r[0] : r; } catch (e) { return null; }
 }
+const btcRules = store("pb_btcrules") || {};   // each desk's market rules text (resolution source, tie rule)
 const btcDiag = {};   // per timeframe: markets found, why not, best edge seen (shown on each BTC desk)
 async function fetchBtcMarkets() {
   const now = Date.now(), out = [];
@@ -495,6 +496,8 @@ async function fetchBtcMarkets() {
     const start = end - j.dur, K = btcCtx.open[Math.floor(start / 60000) * 60000];
     if (!K) { D.why.push("not started"); return; }
     D.found++;
+    { const rs = { src: m.resolutionSource || ev.resolutionSource || "", text: String(m.description || ev.description || "").slice(0, 1500) };
+      if (rs.text && JSON.stringify(btcRules[j.kind]) !== JSON.stringify(rs)) { btcRules[j.kind] = rs; store("pb_btcrules", btcRules); } }
     let upIdx = outcomes.findIndex(o => /^up$/i.test(o)); if (upIdx < 0) upIdx = 0;
     out.push({ q: (m.question || ev.title || j.kind + " BTC").slice(0, 90), tokens, outcomes, liq: parseFloat(m.liquidity || 0), end,
                btc: { kind: j.kind, K, upIdx } });
@@ -516,6 +519,13 @@ const BOLD = store("pb_bcfg") || {};   // old shared settings seed each desk onc
 let BCs = store("pb_bcfg3") || {};
 BKINDS.forEach(k => { BCs[k] = Object.assign({}, BDEFK, BOLD, BCs[k] || {}); delete BCs[k].tf; });
 const bFee = (sh, px) => sh * BFEE * px * (1 - px);
+// cost (incl. fee) of a settled log entry, derived from its P&L so it also works for entries logged before v2.7
+const bUnit = x => x.ask + BFEE * x.ask * (1 - x.ask);
+const bCostOf = x => { const c = bUnit(x); return x.win ? x.pnl * c / (1 - c) : -x.pnl; };
+const bRoiTxt = d => { const stk = d.reduce((a, x) => a + bCostOf(x), 0); if (!(stk > 0)) return "-"; const r = d.reduce((a, x) => a + x.pnl, 0) / stk * 100; return (r >= 0 ? "+" : "") + r.toFixed(0) + "%"; };
+// what the same bet would have made if it had settled the way Polymarket says it did
+const bPmPnl = x => { const cost = bCostOf(x), shares = cost / bUnit(x); return x.pm === "win" ? shares - cost : -cost; };
+const bMismatch = x => (x.pm === "win" || x.pm === "loss") && (x.pm === "win") !== x.win;
 function bEquity(bt) { return bt.cash + Object.values(bt.positions).reduce((a, p) => a + p.shares * (p.last ?? p.entry), 0); }
 async function btcDesk(bm) {
   if (!btcCtx) return;
@@ -590,6 +600,33 @@ async function btcDesk(bm) {
   for (const k of BKINDS) { bts[k].curve.push([Date.now(), bEquity(bts[k])]); bts[k].curve = bts[k].curve.slice(-800); }
   store("pb_btc3", bts);
 }
+// Check every settled bet against Polymarket's own result (free Gamma API, no keys). Newest first, a few per scan.
+async function btcVerify() {
+  const now = Date.now(), batch = [];
+  for (const k of BKINDS) {
+    let n = 0;
+    for (let i = bts[k].log.length - 1; i >= 0 && n < 3; i--) {
+      const x = bts[k].log[i];
+      if (x.win !== null && !x.pm && (!x.pmChk || now - x.pmChk > 60000)) { batch.push([k, x]); n++; }
+    }
+  }
+  if (!batch.length) return;
+  await Promise.all(batch.map(async ([k, x]) => {
+    x.pmChk = now; x.pmTry = (x.pmTry || 0) + 1;
+    try {
+      const m = await udLookup(x.tok);
+      const done = m && (m.closed || String(m.umaResolutionStatus || "").toLowerCase() === "resolved");
+      const idx = m ? parseList(m.clobTokenIds).indexOf(x.tok) : -1, prices = m ? parseList(m.outcomePrices).map(Number) : [];
+      if (done && idx >= 0 && prices.length === 2 && !prices.some(isNaN)) {
+        if (Math.max(...prices) >= 0.98) x.pm = prices[idx] >= 0.5 ? "win" : "loss";
+        else if (prices.every(q => Math.abs(q - 0.5) < 0.03)) x.pm = "void";
+        if (bMismatch(x)) log(`BTC ${k} desk MISMATCH: desk said ${x.win ? "WIN" : "LOSS"}, Polymarket says ${x.pm.toUpperCase()} (${x.o} @ ${(x.ask * 100).toFixed(0)}¢)`, "SYS");
+      }
+    } catch (e) { /* retry next scan */ }
+    if (!x.pm && x.pmTry >= 40) x.pm = "na";   // never resolved or not found: stop asking
+  }));
+  store("pb_btc3", bts);
+}
 const bq = (k, f) => document.querySelector(`#btc_${k} [data-f="${f}"]`);
 function buildBtcCards() {
   $("btcDesks").innerHTML = BKINDS.map(k => `<div class="card" id="btc_${k}">
@@ -617,6 +654,7 @@ function buildBtcCards() {
   <div class="k" style="margin-top:10px">CALIBRATION &middot; does the model's probability match reality?</div>
   <div class="k" data-f="diag" style="margin-top:8px"></div>
   <div data-f="cal"></div>
+  <div data-f="rules"></div>
   <div class="k" style="margin-top:10px">OPEN BTC BETS</div>
   <div data-f="pos"></div>
   <div class="k" style="margin-top:10px">LAST SETTLED</div>
@@ -650,18 +688,18 @@ function renderBtc() {
     ["edge", "minP", "maxP", "bet", "lot", "lowCap"].forEach(f => { const el = bq(k, f); if (el && document.activeElement !== el) el.value = C[f]; });
     const rows = ["model", "lottery"].map(sname => {
       const d = bt.log.filter(x => x.strat === sname && x.win !== null);
-      if (!d.length) return `<div class="bt"><span>${sname}</span><span>0</span><span>-</span><span>-</span><span>-</span></div>`;
+      if (!d.length) return `<div class="bt"><span>${sname}</span><span>0</span><span>-</span><span>-</span><span>-</span><span>-</span></div>`;
       const wr = d.filter(x => x.win).length / d.length * 100, mp = d.reduce((a, x) => a + x.p, 0) / d.length * 100,
         ap = d.reduce((a, x) => a + x.ask, 0) / d.length * 100, pnl = d.reduce((a, x) => a + x.pnl, 0);
-      return `<div class="bt"><span>${sname}</span><span>${d.length}</span><span>${wr.toFixed(0)}%</span><span>${mp.toFixed(0)}% / ${ap.toFixed(0)}¢</span><b class="${pnl >= 0 ? "pos" : "neg"}">${sgn(pnl)}</b></div>`;
+      return `<div class="bt"><span>${sname}</span><span>${d.length}</span><span>${wr.toFixed(0)}%</span><span>${mp.toFixed(0)}% / ${ap.toFixed(0)}¢</span><b class="${pnl >= 0 ? "pos" : "neg"}">${sgn(pnl)}</b><span>${bRoiTxt(d)}</span></div>`;
     });
     // price-band calibration: one average hides long-shot luck, so split by the price paid
     const settled = bt.log.filter(x => x.win !== null);
     const bandRow = (label, d) => {
-      if (!d.length) return `<div class="bt"><span>${label}</span><span>0</span><span>-</span><span>-</span><span>-</span></div>`;
+      if (!d.length) return `<div class="bt"><span>${label}</span><span>0</span><span>-</span><span>-</span><span>-</span><span>-</span></div>`;
       const wr = d.filter(x => x.win).length / d.length * 100, mp = d.reduce((a, x) => a + x.p, 0) / d.length * 100,
         ap = d.reduce((a, x) => a + x.ask, 0) / d.length * 100, pnl = d.reduce((a, x) => a + x.pnl, 0);
-      return `<div class="bt"><span>${label}</span><span>${d.length}</span><span>${wr.toFixed(0)}%</span><span>${mp.toFixed(0)}% / ${ap.toFixed(0)}¢</span><b class="${pnl >= 0 ? "pos" : "neg"}">${sgn(pnl)}</b></div>`;
+      return `<div class="bt"><span>${label}</span><span>${d.length}</span><span>${wr.toFixed(0)}%</span><span>${mp.toFixed(0)}% / ${ap.toFixed(0)}¢</span><b class="${pnl >= 0 ? "pos" : "neg"}">${sgn(pnl)}</b><span>${bRoiTxt(d)}</span></div>`;
     };
     const bands = [["under 10¢", 0, 0.10], ["10-30¢", 0.10, 0.30], ["30-60¢", 0.30, 0.60], ["over 60¢", 0.60, 1.01]];
     const bandRows = bands.map(([nm, lo, hi]) => bandRow(nm, settled.filter(x => x.ask >= lo && x.ask < hi)));
@@ -677,11 +715,20 @@ function renderBtc() {
       ci = ` Win rate 95% range: ${Math.max(0, (c - h) * 100).toFixed(0)}-${Math.min(100, (c + h) * 100).toFixed(0)}%.`;
     }
     const sk = bt.skips || { thin: 0, slip: 0, edge: 0 };
-    set("cal", `<div class="bt h"><span>strategy</span><span>n</span><span>won</span><span>model/paid</span><span>P&amp;L</span></div>` + rows.join("") +
-      `<div class="k" style="margin-top:8px">BY PRICE PAID</div><div class="bt h"><span>band</span><span>n</span><span>won</span><span>model/paid</span><span>P&amp;L</span></div>` + bandRows.join("") +
+    const chk = settled.filter(x => x.pm === "win" || x.pm === "loss"), mism = chk.filter(bMismatch);
+    const pend = settled.filter(x => !x.pm).length, unres = settled.filter(x => x.pm === "na" || x.pm === "void").length;
+    const deskP = chk.reduce((a, x) => a + x.pnl, 0), pmP = chk.reduce((a, x) => a + bPmPnl(x), 0);
+    const pmBlock = `<div class="k" style="margin-top:8px">POLYMARKET CHECK &middot; ${chk.length} verified &middot; <b class="${mism.length ? "neg" : "pos"}">${mism.length} mismatch${mism.length === 1 ? "" : "es"}</b> &middot; ${pend} pending${unres ? ` &middot; ${unres} unresolved/void` : ""}</div>` +
+      (chk.length ? `<div class="k" style="margin-top:4px">Same ${chk.length} bets: desk (Binance) <b class="${deskP >= 0 ? "pos" : "neg"}">${sgn(deskP)}</b> &middot; by Polymarket result <b class="${pmP >= 0 ? "pos" : "neg"}">${sgn(pmP)}</b></div>` : "") +
+      mism.slice(-3).reverse().map(x => `<div class="k" style="margin-top:2px">${esc(x.t)} &middot; ${esc(x.o)} @ ${(x.ask * 100).toFixed(0)}¢: desk ${x.win ? "WIN" : "LOSS"}, Polymarket ${x.pm.toUpperCase()}</div>`).join("");
+    { const R = btcRules[k], el = bq(k, "rules"), key = R ? R.src + "|" + R.text : "";
+      if (el && el.dataset.key !== key) { el.dataset.key = key;
+        el.innerHTML = R ? `<details style="margin-top:8px"><summary class="k" style="cursor:pointer">How this market settles (Polymarket's rules text)</summary><div class="k" style="white-space:pre-wrap;margin-top:6px">${R.src ? "Source: " + esc(R.src) + "\n\n" : ""}${esc(R.text)}</div></details>` : ""; } }
+    set("cal", `<div class="bt h"><span>strategy</span><span>n</span><span>won</span><span>model/paid</span><span>P&amp;L</span><span>ROI</span></div>` + rows.join("") +
+      `<div class="k" style="margin-top:8px">BY PRICE PAID</div><div class="bt h"><span>band</span><span>n</span><span>won</span><span>model/paid</span><span>P&amp;L</span><span>ROI</span></div>` + bandRows.join("") +
       `<div class="k" style="margin-top:6px">Logged P&amp;L <b class="${total >= 0 ? "pos" : "neg"}">${sgn(total)}</b> &middot; without top 3 wins <b class="${trimmed >= 0 ? "pos" : "neg"}">${sgn(trimmed)}</b></div>` +
-      `<div class="k" style="margin-top:4px">${settled.length}/100 settled.${ci} If "won" is well below "model", the model is overconfident.</div>` +
-      `<div class="k" style="margin-top:4px">Skipped for realistic fills: thin book ${sk.thin} &middot; slippage ${sk.slip} &middot; edge gone at fill price ${sk.edge}</div>`);
+      `<div class="k" style="margin-top:4px">${settled.length}/100 settled. ROI = P&amp;L per $ staked (approx).${ci} If "won" is well below "model", the model is overconfident.</div>` +
+      `<div class="k" style="margin-top:4px">Skipped for realistic fills: thin book ${sk.thin} &middot; slippage ${sk.slip} &middot; edge gone at fill price ${sk.edge}</div>` + pmBlock);
     set("pos", pos.map(([t, p]) => {
       const u = (p.last - p.entry) * p.shares;
       return `<div class="brow"><span>${esc(p.o)} · ${p.strat} @ ${p.entry.toFixed(3)} ($${p.cost.toFixed(1)}) <span class="cd" data-end="${p.end}"></span></span><b class="${u >= 0 ? "pos" : "neg"}">${sgn(u)}</b></div>`;
@@ -879,6 +926,7 @@ async function scan() {
       try {
         const bm = await fetchBtcMarkets();
         await btcDesk(bm);
+        try { await btcVerify(); } catch (e) { log("Polymarket check error: " + e.message); }
         st.btc = { S: btcCtx.S, n: bm.length };
         log(`BTC $${btcCtx.S.toFixed(0)} · vol ${(btcCtx.sig * 100).toFixed(3)}%/min · ${bm.length} up/down markets`);
       } catch (e) { log("BTC markets error: " + e.message); }
