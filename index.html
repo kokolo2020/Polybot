@@ -272,8 +272,8 @@
 </div>
 
 <script>
-const VERSION = "v2.9";
-const BUILD = "2026-10-28 19:45";
+const VERSION = "v2.9.1";
+const BUILD = "2026-10-28 20:20";
 const ON_WEB = location.protocol.startsWith("http");
 const BIN = ON_WEB ? "/binance" : "https://data-api.binance.vision";
 const GAMMA = ON_WEB ? "/gamma" : "https://gamma-api.polymarket.com";
@@ -692,8 +692,10 @@ function buildBtcCards() {
     bq(k, "on").onclick = () => { C.on = C.on ? 0 : 1; save(); renderBtc(); };
     if (bq(k, "lotBtn")) bq(k, "lotBtn").onclick = () => { C.lottery = C.lottery ? 0 : 1; save(); renderBtc(); };
     bq(k, "csv").onclick = async () => {
-      const rows = [["kind", "up", "ask", "p", "K", "S0", "sg", "en", "pm", "px"]];
-      bts[k].log.filter(x => x.px && x.pm).forEach(x => rows.push([k, x.up ? 1 : 0, x.ask.toFixed(4), x.p.toFixed(3), x.K, x.S0, x.sg != null ? x.sg.toFixed(6) : "", x.en, x.pm, x.px.join("|")]));
+      // every verified bet (old ones have no window data: those columns stay empty)
+      const rows = [["kind", "time", "strat", "up", "ask", "p", "K", "S0", "sg", "en", "pm", "binWin", "px"]];
+      bts[k].log.filter(x => x.pm === "win" || x.pm === "loss").forEach(x => rows.push([k, String(x.t).replace(/,/g, ""), x.strat, x.up == null ? "" : (x.up ? 1 : 0), x.ask.toFixed(4), x.p.toFixed(3),
+        x.K ?? "", x.S0 ?? "", x.sg != null ? x.sg.toFixed(6) : "", x.en ?? "", x.pm, x.binWin == null ? "" : (x.binWin ? "win" : "loss"), x.px ? x.px.join("|") : ""]));
       const txt = rows.map(r => r.join(",")).join("\n"), box = bq(k, "csvbox");
       try { await navigator.clipboard.writeText(txt); toast(`Copied ${rows.length - 1} bets`, "BUY"); box.style.display = "none"; }
       catch (e) { box.value = txt; box.style.display = "block"; box.select(); toast("Select all and copy the box below", "BUY"); }
