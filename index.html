@@ -272,8 +272,8 @@
 </div>
 
 <script>
-const VERSION = "v2.10";
-const BUILD = "2026-10-28 21:30";
+const VERSION = "v2.10.1";
+const BUILD = "2026-10-28 22:50";
 const ON_WEB = location.protocol.startsWith("http");
 const BIN = ON_WEB ? "/binance" : "https://data-api.binance.vision";
 const GAMMA = ON_WEB ? "/gamma" : "https://gamma-api.polymarket.com";
@@ -472,6 +472,17 @@ async function eventBySlug(slug) {
 }
 // Polymarket's own "price to beat" (what the site shows): public call, same data the market settles against
 const pmOpenCache = {};
+let pmRatios = store("pb_pmratios") || {};   // window -> PM open / Binance open
+function pmRatioAdd(key, r) {
+  if (!(r > 0.99 && r < 1.01) || pmRatios[key]) return;
+  pmRatios[key] = r;
+  const ks = Object.keys(pmRatios); if (ks.length > 60) delete pmRatios[ks[0]];
+  store("pb_pmratios", pmRatios);
+}
+function pmRatioMed() {
+  const v = Object.values(pmRatios).sort((a, b) => a - b);
+  return v.length >= 5 ? v[Math.floor(v.length / 2)] : null;
+}
 async function pmOpen(kind, start, end) {
   const key = kind + start;
   if (pmOpenCache[key]) return pmOpenCache[key];
@@ -510,7 +521,13 @@ async function fetchBtcMarkets() {
     if (!Kb) { D.why.push("not started"); return; }
     let K = Kb, Ksrc = "bn";
     const pmo = (j.kind === "5m" || j.kind === "15m") ? await pmOpen(j.kind, start, end) : null;
-    if (pmo) { K = pmo; Ksrc = "pm"; } else if (j.kind !== "1h") D.why.push("PM start price n/a, using Binance");
+    if (pmo) {
+      // Polymarket prices are USD, Binance BTCUSDT is in USDT (~0.14% apart), so put the strike in Binance units
+      // using the typical ratio seen at past window starts; the leftover difference is the real feed gap.
+      pmRatioAdd(j.kind + start, pmo / Kb);
+      const med = pmRatioMed();
+      if (med) { K = pmo / med; Ksrc = "pm"; } else D.why.push("PM start price: learning USD/USDT ratio, using Binance strike");
+    } else if (j.kind !== "1h") D.why.push("PM start price n/a, using Binance");
     D.found++;
     { const rs = { src: m.resolutionSource || ev.resolutionSource || "", text: String(m.description || ev.description || "").slice(0, 1500) };
       if (rs.text && JSON.stringify(btcRules[j.kind]) !== JSON.stringify(rs)) { btcRules[j.kind] = rs; store("pb_btcrules", btcRules); } }
