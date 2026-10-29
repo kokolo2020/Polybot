@@ -20,7 +20,7 @@ CLOB = "https://clob.polymarket.com"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
 OUT = os.path.join(DATA, "calib.csv")
-COLS = ["id", "slug", "category", "end_ts", "volume", "p_1d", "p_7d", "yes_won"]
+COLS = ["id", "slug", "category", "end_ts", "volume", "p_1d", "p_7d", "yes_won", "end_date_ts", "closed_ts", "q"]
 PRIORITY = ["Politics", "Sports", "Crypto", "Business", "Science", "Tech", "Culture", "Geopolitics", "Economy"]
 
 
@@ -85,7 +85,8 @@ def work(item):
         vol = float(m.get("volume") or 0)
         if vol < 5000:
             return no("volume < $5k")
-        ends = [x for x in (ts(m.get("endDate")), ts(m.get("closedTime"))) if x]
+        ed, ct = ts(m.get("endDate")), ts(m.get("closedTime"))
+        ends = [x for x in (ed, ct) if x]
         end = min(ends) if ends else None
         if not end or end > time.time():
             return no("no/future end date")
@@ -97,7 +98,8 @@ def work(item):
         p1, p7 = price_at(h, end - 86400, 2 * 86400), price_at(h, end - 7 * 86400, 2 * 86400)
         if p1 is None and p7 is None:
             return no("no price history near 1d/7d")
-        return [m.get("id"), m.get("slug"), category(ev), end, round(vol), "" if p1 is None else p1, "" if p7 is None else p7, int(pr[0] > 0.5)]
+        return [m.get("id"), m.get("slug"), category(ev), end, round(vol), "" if p1 is None else p1, "" if p7 is None else p7, int(pr[0] > 0.5),
+                ed or "", ct or "", str(m.get("question", ""))[:70].replace(",", " ")]
     except Exception as e:
         if len(FIRST_ERR) < 3:
             FIRST_ERR.append(f"{type(e).__name__}: {e}")
@@ -167,6 +169,22 @@ def report():
     print(f"{len(rows)} resolved markets, {rows[0]['end_ts']} .. {rows[-1]['end_ts']}")
     for key, name in (("p_1d", "1 day before close"), ("p_7d", "7 days before close")):
         table(rows, key, f"ALL markets, price {name} (gap = real win rate minus price; ROI = buying Yes at that price)")
+    clean = [r for r in rows if r.get("end_date_ts") and r.get("closed_ts") and abs(int(r["end_date_ts"]) - int(r["closed_ts"])) <= 86400]
+    print(f"\nCLEAN subset (closed within 1 day of its end date): {len(clean)} of {len(rows)} markets")
+    table(clean, "p_1d", "CLEAN markets only, 1 day before close")
+    cc = {}
+    for r in clean:
+        cc.setdefault(r["category"], []).append(r)
+    for c in ("Politics", "Sports", "Crypto"):
+        part = cc.get(c, [])
+        if len(part) >= 100:
+            h2 = len(part) // 2
+            table(part[:h2], "p_1d", f"CLEAN {c} OLDER half")
+            table(part[h2:], "p_1d", f"CLEAN {c} NEWER half")
+    ex = [r for r in rows if r["category"] == "Crypto" and r["p_1d"] and .5 <= r["p_1d"] < .65][:25]
+    print("\nEXAMPLES: Crypto markets priced 0.50-0.65 a day before close")
+    for r in ex:
+        print(r["slug"][:55], r["p_1d"], "won" if r["yes_won"] else "lost", r.get("q", "")[:50])
     half = len(rows) // 2
     for nm, part in (("OLDER half (find patterns here)", rows[:half]), ("NEWER half (confirm here)", rows[half:])):
         table(part, "p_1d", f"{nm}, 1 day before close")
