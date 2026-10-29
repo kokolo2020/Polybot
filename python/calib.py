@@ -89,7 +89,11 @@ def work(item):
         end = min(ends) if ends else None
         if not end or end > time.time():
             return no("no/future end date")
-        h = get(CLOB + "/prices-history", {"market": toks[0], "startTs": end - 9 * 86400, "endTs": end, "fidelity": 360}).get("history", [])
+        h = get(CLOB + "/prices-history", {"market": toks[0], "interval": "max", "fidelity": 720}).get("history", [])
+        if not h:
+            h = get(CLOB + "/prices-history", {"market": toks[0], "startTs": end - 9 * 86400, "endTs": end, "fidelity": 720}).get("history", [])
+        if not h and len(FIRST_ERR) < 3:
+            FIRST_ERR.append(f"empty history for token {toks[0][:12]}.. end={end}")
         p1, p7 = price_at(h, end - 86400, 2 * 86400), price_at(h, end - 7 * 86400, 2 * 86400)
         if p1 is None and p7 is None:
             return no("no price history near 1d/7d")
