@@ -65,26 +65,39 @@ def price_at(hist, cut, max_gap):
     return p if p is not None and cut - tt <= max_gap else None
 
 
+WHY = {}
+FIRST_ERR = []
+
+
+def no(reason):
+    WHY[reason] = WHY.get(reason, 0) + 1
+    return None
+
+
 def work(item):
     ev, m = item
     try:
         toks, outs, pr = lst(m.get("clobTokenIds")), lst(m.get("outcomes")), [float(x) for x in lst(m.get("outcomePrices"))]
-        if len(toks) != 2 or [str(o).lower() for o in outs] != ["yes", "no"] or max(pr) < 0.98:
-            return None
+        if len(toks) != 2 or [str(o).lower() for o in outs] != ["yes", "no"]:
+            return no("not binary yes/no")
+        if len(pr) != 2 or max(pr) < 0.98:
+            return no("not cleanly resolved")
         vol = float(m.get("volume") or 0)
         if vol < 5000:
-            return None
+            return no("volume < $5k")
         ends = [x for x in (ts(m.get("endDate")), ts(m.get("closedTime"))) if x]
         end = min(ends) if ends else None
         if not end or end > time.time():
-            return None
+            return no("no/future end date")
         h = get(CLOB + "/prices-history", {"market": toks[0], "startTs": end - 9 * 86400, "endTs": end, "fidelity": 360}).get("history", [])
         p1, p7 = price_at(h, end - 86400, 2 * 86400), price_at(h, end - 7 * 86400, 2 * 86400)
         if p1 is None and p7 is None:
-            return None
+            return no("no price history near 1d/7d")
         return [m.get("id"), m.get("slug"), category(ev), end, round(vol), "" if p1 is None else p1, "" if p7 is None else p7, int(pr[0] > 0.5)]
-    except Exception:
-        return None
+    except Exception as e:
+        if len(FIRST_ERR) < 3:
+            FIRST_ERR.append(f"{type(e).__name__}: {e}")
+        return no("error")
 
 
 def collect(max_events):
@@ -115,7 +128,9 @@ def collect(max_events):
                     n += 1
         f.flush()
         off += 50
-        print(f"events {off}/{max_events}  rows added {n}", flush=True)
+        print(f"events {off}/{max_events}  rows added {n}  skipped: {WHY}", flush=True)
+        if FIRST_ERR and n == 0:
+            print("  first errors:", FIRST_ERR, flush=True)
         time.sleep(0.5)
     f.close()
 
